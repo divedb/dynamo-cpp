@@ -38,3 +38,6 @@
 	path = third_party/Catch2
 	url = https://github.com/catchorg/Catch2.git
 	shallow = true
+[submodule "third_party/dynamo"]
+	path = third_party/dynamo
+	url = https://github.com/ai-dynamo/dynamo.git
