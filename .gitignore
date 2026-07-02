@@ -36,4 +36,4 @@ CTestTestfile.cmake
 *.pb.h
 *.pb.cpp
 *_pb2.py
-dynamo/
+
