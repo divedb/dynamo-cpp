@@ -1,0 +1,2 @@
+add_executable(echo_pipeline main.cpp)
+target_link_libraries(echo_pipeline PRIVATE dynamo_runtime)

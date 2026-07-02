@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package dynamo.runtime;
+
+service EndpointService {
+    // Bidirectional streaming for request/response
+    rpc Call(stream EndpointMessage) returns (stream EndpointMessage);
+}
+
+message EndpointMessage {
+    string request_id = 1;
+    string endpoint_name = 2;
+    string component_name = 3;
+    string namespace_name = 4;
+
+    oneof payload {
+        RequestMetadata request_meta = 10;
+        ResponseMetadata response_meta = 11;
+        bytes data = 12;
+        ControlMessage control = 13;
+    }
+
+    map<string, string> context = 20;
+}
+
+message RequestMetadata {
+    string method = 1;
+    uint64 content_length = 2;
+    bool stream_response = 3;
+}
+
+message ResponseMetadata {
+    uint32 status_code = 1;
+    string status_message = 2;
+    uint64 content_length = 3;
+}
+
+message ControlMessage {
+    enum Type {
+        STOP = 0;
+        KILL = 1;
+        SENTINEL = 2;
+        HEARTBEAT = 3;
+    }
+    Type type = 1;
+    string reason = 2;
+}
+
+message ComponentRegistration {
+    string namespace_name = 1;
+    string component_name = 2;
+    string endpoint_name = 3;
+    string addr = 4;
+    int32 port = 5;
+    int64 lease_ttl_seconds = 6;
+    uint64 revision = 7;
+    map<string, string> metadata = 8;
+}
+
+message DiscoveryRequest {
+    string namespace_name = 1;
+    string component_name = 2;
+    string endpoint_name = 3;
+}
+
+message DiscoveryResponse {
+    repeated ComponentRegistration endpoints = 1;
+}

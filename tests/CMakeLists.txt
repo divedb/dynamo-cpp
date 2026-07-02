@@ -1,0 +1,5 @@
+add_subdirectory(runtime_tests)
+add_subdirectory(pipeline_tests)
+add_subdirectory(component_tests)
+add_subdirectory(network_tests)
+add_subdirectory(llm_tests)
