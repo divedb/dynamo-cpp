@@ -37,3 +37,13 @@ CTestTestfile.cmake
 *.pb.cpp
 *_pb2.py
 
+
+# Per-preset build trees
+build-*/
+
+# Plain-clone deps fetched by CI, not tracked (see .github/workflows/ci.yml)
+third_party/toml11/
+third_party/nlohmann_json/
+third_party/Catch2/
+third_party/xxHash/
+third_party/minja/

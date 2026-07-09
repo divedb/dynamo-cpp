@@ -1,4 +1,0 @@
-add_subdirectory(hello_runtime)
-add_subdirectory(echo_pipeline)
-add_subdirectory(distributed_echo)
-add_subdirectory(llm_minimal)

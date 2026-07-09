@@ -1,646 +1,546 @@
-# Dynamo C++20 — Implementation TODO
+# TODO — dynamo-cpp vs. Dynamo gap analysis
 
-This document enumerates every gap between the NVIDIA Dynamo Rust implementation and the C++20 reimplementation, organized by module. Each item includes rationale, affected components, dependencies, estimated complexity (XS–XL), and recommended implementation order.
+Comparison of this implementation against `third_party/dynamo` (Rust, v0.1.0,
+commit `3983830e80` — the same commit as the `~/Documents/git/dynamo`
+checkout). Sections 1–7 cover `lib/runtime` parity (complete except P3s);
+section 8 plans the `lib/llm` layer as milestones; section 9 lists what stays
+out of scope; section 10 records what the fresh audit found (open gaps +
+verified dead code in the Rust reference).
+Each task names the Rust reference and the C++ module it lands in.
+Priorities: **P0** = core behavioral parity, **P1** = functional parity, **P2** = robustness/scale, **P3** = optional/out-of-scope candidates.
 
----
-
-## Phase 0: Make Existing Code Compile (Order: 0)
-
-These items block all further work — without functioning headers and a working build, nothing else can be validated.
-
-### 0.1 Create all header files
-| Rust File | C++ Status | Gap |
-|---|---|---|
-| `lib/runtime/src/lib.rs` (86L) | ❌ No `lib.rs` equivalent | No module declaration file, no re-exports, no `DistributedRuntime` type. C++ namespace `dynamo` is declared piecemeal across headers. |
-| `runtime.rs` (137L) | ⚠️ `runtime.cpp` exists | **Missing header**: `<dynamo/runtime.h>` is included but not created. Missing `RuntimeType` enum, `child_token()`, `id()` accessor. |
-| `config.rs` (236L) | ⚠️ `config.cpp` exists | **Missing header**: `<dynamo/config.h>` is included but not created. Missing `RuntimeConfigBuilder`, `single_threaded()`, `create_runtime()`, `env_is_truthy()`, `is_truthy()`, `jsonl_logging_enabled()`, `disable_ansi_logging()`. |
-| `engine.rs` (168L) | ⚠️ `engine.cpp` exists | **Missing header**: `<dynamo/engine.h>` is included but not created. Missing `Data` trait concept, `DataUnary`/`DataStream` aliases, `AsyncEngineContext` trait, `AsyncEngineContextProvider`, `AsyncEngineUnary`, `AsyncEngineStream`, `ResponseStream`. |
-| `component.rs` (436L) | ⚠️ `component.cpp` exists | **Missing header**: `<dynamo/component.h>` is included but not created. Missing `TransportType` enum, `ComponentEndpointInfo`, `Registry`, `ComponentBuilder`, `EndpointConfig`, all `list_endpoints()/scrape_stats()/stats_stream()` methods, `validate_allowed_chars()`. |
-| `discovery.rs` (86L) | ⚠️ `discovery.cpp` exists | **Missing header**: `<dynamo/discovery.h>`. Missing `primary_lease_id()`, real etcd integration. |
-| `pipeline.rs` (121L) | ⚠️ Stub .cpp | **Missing header**: `<dynamo/pipeline.h>`. Missing all type aliases (`SingleIn`, `ManyIn`, `SingleOut`, `ManyOut`, `ServiceEngine`, `UnaryEngine`, `ServerStreamingEngine`, `ClientStreamingEngine`, `BidirectionalStreamingEngine`), `PipelineIO` trait, `Event` struct. |
-| `pipeline/context.rs` (467L) | ⚠️ Stub .cpp | **Missing header**: `<dynamo/pipeline/context.h>`. Missing `Context<T>`, `Controller` (state machine), `StreamContext`, `Registry` (type-erased), `State` enum, `IntoContext` trait, `map()/try_map()/transfer()/into_parts()/insert()/get()/clone_unique()/take_unique()`. |
-| `pipeline/nodes.rs` (351L) | ⚠️ Stub .cpp | **Missing header**: `<dynamo/pipeline/nodes.h>`. Missing `Source<T>`, `Sink<T>`, `Edge<T>`, `Operator<UI,UO,DI,DO>`, `PipelineOperator<...>`, `PipelineNode<In,Out>`, `NodeFn`, `ServiceFrontend`, `ServiceBackend`, `SegmentSource`, `SegmentSink`. |
-| `protocols/annotated.rs` (168L) | ❌ Missing | **Missing header**: `<dynamo/protocols/annotated.h>`. Missing `Annotated<T>` with `from_error()`, `from_data()`, `from_annotation()`, `ok()`, `is_ok()`, `is_err()`, `is_event()`, `transfer()`, `map_data()`, `into_result()`. |
-| `worker.rs` (211L) | ❌ Missing | **Missing header**: `<dynamo/worker.h>`. Missing `Worker` struct with `from_settings()`, `execute()`, `signal_handler()`, shutdown timeout constants. |
-| `slug.rs` (163L) | ❌ Missing | **Missing header**: `<dynamo/slug.h>`. Missing `Slug` class with BLAKE3-based unique slugification, `InvalidSlugError`. |
-| `traits.rs` (33L) | ❌ Missing | **Missing header**: `<dynamo/traits.h>`. Missing `RuntimeProvider`, `DistributedRuntimeProvider`, `EventPublisher`, `EventSubscriber` traits. |
-
-**Rationale**: Without headers, nothing compiles. The existing `.cpp` files `#include` files that don't exist.
-**Dependencies**: None (prerequisite for everything).
-**Complexity**: M — 12 header files, mostly porting Rust declarations to C++.
-**Implementation order**: **0 — MUST GO FIRST**.
-
-### 0.2 Fix proto build integration
-**Gap**: The root `CMakeLists.txt` references `dynamo_protos` but the protobuf generation logic uses `protobuf_generate()` which requires `find_package(Protobuf)` and `find_program(grpc_cpp_plugin)`. The `find_package(Protobuf)` call occurs before submodules are configured, which will fail until protobuf is built.
-
-**Rationale**: The gRPC service stubs (EndpointService, LLMService) are needed by transport and llm modules.
-**Dependencies**: 0.1 (headers exist), protobuf + grpc submodule availability.
-**Complexity**: M — restructure CMake to build protobuf first or use an ExternalProject/bundle approach.
-**Implementation order**: **0** (parallel with 0.1).
-
-### 0.3 Restructure CMake to handle Folly + gRPC complexity
-**Gap**: Folly has complex build requirements (double-conversion, glog, gflags, libevent, fmt, etc.). gRPC requires protobuf, cares about ABI, and has its own submodules. The current CMakeLists.txt naively does `add_subdirectory` on each — this will fail in practice.
-
-**Rationale**: Neither Folly nor gRPC are simple "drop-in subdirectory" dependencies. They need proper handling.
-**Dependencies**: 0.1, 0.2.
-**Complexity**: XL — Folly and gRPC both have deep dependency chains and platform-specific build issues.
-**Implementation order**: **0** (parallel with 0.1, 0.2).
+**Last full re-audit: 2026-07-09.** Every `.rs` file under `lib/runtime` and
+`lib/llm` was mapped to a TODO entry, a C++ module, a §9 out-of-scope item, or
+the §10.2 dead-code list; completed claims were spot-checked against both
+source trees; test suite green at 122/122 (Debug).
 
 ---
 
-## Phase 1: Core Runtime Completeness (Order: 1)
-
-### 1.1 Create `DistributedRuntime` class
-**Rust**: `lib.rs:71-86` — `DistributedRuntime { runtime, etcd_client, nats_client, tcp_server, component_registry }`
-**C++**: ❌ Missing.
-
-**What to add**: A new class `dynamo::DistributedRuntime` that holds:
-- `std::shared_ptr<Runtime> runtime`
-- `std::shared_ptr<transport::EtcdClient> etcd_client`
-- `std::shared_ptr<transport::GrpcServer> grpc_server`
-- `std::shared_ptr<ComponentRegistry> component_registry`
-
-Implements `RuntimeProvider` (delegates to `runtime`).
-
-**Rationale**: This is the central coordination point in Dynamo. Every component, endpoint, and discovery operation flows through it. Without it, nothing in the distributed model works.
-**Dependencies**: 0.1, 0.3.
-**Complexity**: S.
-**Implementation order**: **1**.
-
-### 1.2 Add `Runtime::id()` and `Runtime::child_token()`
-**Rust**: `runtime.rs:57`, `runtime.rs:93`, `runtime.rs:106`
-**C++**: ❌ Missing `id()` accessor; `child_token()` not implemented.
-
-**What to add**:
-- `const std::string& Runtime::id() const noexcept`
-- `CancellationToken Runtime::child_token()` — creates a linked token that cancels when the parent cancels.
-
-**Rationale**: `id()` is used throughout Dynamo for logging, lease naming, and endpoint registration. `child_token()` is essential for hierarchical cancellation (stream-level cancellation inheriting from runtime-level shutdown).
-**Dependencies**: 1.1.
-**Complexity**: XS.
-**Implementation order**: **1** (parallel with 1.1).
-
-### 1.3 Add `RuntimeType` enum and `from_current()`/`single_threaded()` factories
-**Rust**: `runtime.rs:23-29` — `RuntimeType { Shared(Arc<Runtime>), External(Handle) }`, `Runtime::from_current()`, `Runtime::from_handle()`, `Runtime::single_threaded()`
-**C++**: ❌ Missing.
-
-**What to add**:
-- `enum class RuntimeType { Internal, External }` — or use folly executor types
-- `static std::shared_ptr<Runtime> Runtime::single_threaded()` — creates a runtime with one worker thread
-- `static std::shared_ptr<Runtime> Runtime::from_existing(folly::Executor&)` — wraps an existing executor
-
-**Rationale**: The Rust code supports multiple construction modes for embedding scenarios. Without these, Dynamo can't be embedded in other applications.
-**Dependencies**: 1.1.
-**Complexity**: S.
-**Implementation order**: **1**.
-
-### 1.4 Implement `Worker` class with signal handling
-**Rust**: `worker.rs:60-211`
-**C++**: ❌ Missing.
-
-**What to add**: A `Worker` class that:
-- Takes a `RuntimeConfig` or `Runtime`
-- Provides `execute(Fn)` that blocks and handles `SIGINT`/`SIGTERM`
-- Implements graceful shutdown with configurable timeout (default: 30s release, 5s debug)
-- Returns exit code 911 on signal (matching Rust behavior)
-
-**Rationale**: Every Dynamo binary (dynamo-run, http component, llmctl) uses `Worker::execute()` as its entry point. Without it, no application can use the runtime properly.
-**Dependencies**: 1.1, 1.2.
-**Complexity**: M — need signal handling (sigaction + signalfd or folly::AsyncSignalHandler).
-**Implementation order**: **2**.
-
-### 1.5 Add config helpers: `env_is_truthy()`, `is_truthy()`, `RuntimeConfigBuilder`
-**Rust**: `config.rs:146-171`
-**C++**: ❌ Missing.
-
-**What to add**:
-- `bool env_is_truthy(const char* env)` / `bool is_truthy(std::string_view)` — "true", "1", "yes" → true
-- `RuntimeConfigBuilder` class with fluent API: `.num_worker_threads(N)`, `.max_blocking_threads(N)`, `.build()`
-- `RuntimeConfig::single_threaded()` convenience factory
-
-**Rationale**: These helpers are used across the Rust codebase and make config construction ergonomic. Without the builder, C++ code uses aggregate initialization which is fragile.
-**Dependencies**: 0.1.
-**Complexity**: XS.
-**Implementation order**: **2** (parallel with 1.4).
-
----
-
-## Phase 2: Component Model (Order: 2)
-
-### 2.1 Create `Endpoint::Client<T,U>` with routing strategies
-**Rust**: `component/client.rs:52-256`
-**C++**: ❌ Missing.
-
-**What to add**: A `Client<Req, Resp>` template class on `Endpoint` with:
-- `round_robin()` — round-robin across discovered endpoint instances
-- `random()` — random selection
-- `direct(endpoint_id)` — direct to specific instance
-- `wait_for_endpoints()` — block until endpoints appear
-- `endpoint_ids()` — current live endpoint list
-- Implements `AsyncEngine<Req, Resp>` delegating to gRPC stub
-
-Uses `DiscoveryClient` to watch for endpoint changes (etcd prefix watch → update local routing table).
-
-**Rationale**: Without `Client`, endpoints are one-way. The whole point of the component model is RPC — `Client` is the caller side.
-**Dependencies**: 1.1 (DistributedRuntime), 1.5 (DiscoveryClient), gRPC service stubs.
-**Complexity**: L — requires etcd watcher integration, routing state machine, gRPC stub lifetime management.
-**Implementation order**: **3**.
-
-### 2.2 Implement `ServiceConfig` / `EndpointConfig` with gRPC-based endpoint lifecycle
-**Rust**: `component/service.rs:110L`, `component/endpoint.rs:143L`
-**C++**: ❌ Missing.
-
-**What to add**:
-- `EndpointConfig` class with `from_endpoint(endpoint)`, `stats_handler(callback)`, `start()`
-- `ServiceConfig` class with `from_component(component)`, `description()`, `create()`
-- `start()` registers the gRPC service, creates an etcd lease, writes `ComponentRegistration` to etcd
-
-**Rationale**: The Rust code uses `ServiceConfig::create()` to bring up a component with NATS service + etcd registration. Without this, endpoints can't be discovered.
-**Dependencies**: 2.1, real etcd client (3.2), gRPC service implementation (4.1).
-**Complexity**: L — ties together gRPC service registration, etcd lease management, and component lifecycle.
-**Implementation order**: **4**.
-
-### 2.3 Add `Registry` for shared endpoint watchers
-**Rust**: `component/registry.rs:99L`
-**C++**: ❌ Missing.
-
-**What to add**: A thread-safe singleton-per-`DistributedRuntime` that tracks active etcd watchers so multiple `Client` instances targeting the same remote endpoint share a single watcher task.
-
-**Rationale**: Without this, creating 100 `Client` objects for the same remote endpoint creates 100 redundant etcd watchers.
-**Dependencies**: 2.1.
-**Complexity**: S — mutex-guarded map of watcher IDs.
-**Implementation order**: **4** (parallel with 2.2).
-
-### 2.4 Add `Slug` class with BLAKE3-based unique slugification
-**Rust**: `slug.rs:163L`
-**C++**: ❌ Missing.
-
-**What to add**: `Slug(std::string)` that:
-- Lowercases, keeps only `[a-z0-9_]`
-- Appends a 4-byte BLAKE3 hash suffix for uniqueness
-- Implements `Display`, comparison, `TryFrom<std::string>`, `AsRef<std::string>`
-
-**Rationale**: Slugs are used for NATS subject generation and service naming. With gRPC they're less critical, but still needed for etcd paths, component names, and human-readable identifiers.
-**Dependencies**: None (can use `<openssl/sha.h>` or `<blake3.h>`).
-**Complexity**: S — handful of free functions, could use abseil strings + a hash library.
-**Implementation order**: **2** (parallel with 1.4, 1.5).
-
----
-
-## Phase 3: Transport & Service Discovery (Order: 3)
-
-### 3.1 Implement real etcd client via gRPC
-**Rust**: `transports/etcd/` (implied via `etcd-client` crate)
-**C++**: In-memory mock only.
-
-**What to add**: Replace `transport_etcd.cpp`'s in-memory `std::map` with real etcd gRPC calls:
-- Connect via gRPC to `EtcdConfig::endpoints`
-- `put(key, value)` → `etcdserverpb::PutRequest`
-- `get(key)` → `etcdserverpb::RangeRequest`
-- `del(key)` → `etcdserverpb::DeleteRangeRequest`
-- `get_prefix(prefix)` → `etcdserverpb::RangeRequest` with range_end
-- `grant_lease(ttl)` → `etcdserverpb::LeaseGrantRequest`
-- `keep_alive_lease(id)` → `etcdserverpb::LeaseKeepAliveRequest` (bidirectional streaming)
-- `watch_prefix(prefix, cb)` → `etcdserverpb::WatchRequest` (bidirectional streaming)
-- `revoke_lease(id)` → `etcdserverpb::LeaseRevokeRequest`
-
-**Rationale**: In-memory etcd is useless for distributed operation. Without real etcd, service discovery doesn't work across nodes.
-**Dependencies**: 0.2 (protobuf build), gRPC availability.
-**Complexity**: XL — etcd gRPC API is extensive, lease keep-alive is a streaming RPC with complex lifecycle management, and the watcher protocol requires maintaining watch IDs and reconnections.
-**Implementation order**: **5**.
-
-### 3.2 Implement etcd lease keep-alive loop
-**Rust**: `transports/etcd/lease.rs:117L`
-**C++**: ❌ Missing.
-
-**What to add**: A background coroutine that:
-- Takes a lease ID, TTL, and cancellation token
-- Sends periodic `LeaseKeepAliveRequest` via gRPC bidirectional stream
-- Retries with exponential backoff on failure
-- Revokes lease on cancellation
-- Logs warnings if heartbeat fails repeatedly
-
-**Rationale**: Without keep-alive, etcd leases expire in seconds and component registrations disappear. Every production deployment needs this.
-**Dependencies**: 3.1 (real etcd client).
-**Complexity**: L — background task lifecycle, streaming RPC management, retry logic.
-**Implementation order**: **5** (parallel with 3.1).
-
-### 3.3 Implement etcd prefix watcher with reconnection
-**Rust**: `transports/etcd/` (watcher via `etcd-client` crate)
-**C++**: ❌ Missing.
-
-**What to add**: A watcher that:
-- Opens a `WatchRequest` bidirectional gRPC stream for a prefix
-- Receives `WatchResponse` events (Put, Delete)
-- Translates to `WatchCallback(key, value, deleted)` invocations
-- Reconnects on stream failure with backoff
-- Maintains a map of watch IDs for cancellation
-
-**Rationale**: Service discovery relies on prefix watching. Without this, `Client` can't react to endpoint changes.
-**Dependencies**: 3.1.
-**Complexity**: L — streaming gRPC management, reconnection logic, event deduplication.
-**Implementation order**: **5** (parallel with 3.1, 3.2).
-
-### 3.4 Implement TCP call-handshake protocol
-**Rust**: `pipeline/network/tcp/server.rs:614L`
-**C++**: ⚠️ `transport_tcp.cpp` — basic `TcpServer`/`TcpClient` only.
-
-**What to add**:
-- `CallHomeHandshake` message — first TCP bytes identifying stream subject and type (request/response)
-- `ControlMessage` — STOP, KILL, SENTINEL sentinel values for stream lifecycle
-- `TwoPartCodec` — length-delimited framing: header (control message) + body (payload), xxhash3 checksums
-- `PendingConnections` / `RegisteredStream` — registration pattern for call-home response streaming
-- `ResponseService` trait — `register(options) -> PendingConnections`
-- `StreamOptions` — configurable buffer sizes, timeouts
-
-**Rationale**: The TCP call-home pattern is fundamental to Dynamo's data plane. Without the full handshake and codec, TCP transport is not interoperable with the Rust implementation.
-**Dependencies**: 0.1, asio.
-**Complexity**: L — wire protocol implementation, buffer management, framing codec.
-**Implementation order**: **6**.
-
----
-
-## Phase 4: Pipeline Execution Model (Order: 4)
-
-### 4.1 Implement full `Context<T>` with `Controller` state machine
-**Rust**: `pipeline/context.rs:467L`
-**C++**: ❌ Stub file only.
-
-**What to add**: Full `Context<T>` class in `<dynamo/pipeline/context.h>`:
-- `Controller` with watch-channel-based state machine (`State::Live | Stopped | Killed`)
-- `Context<T>` with `id()`, `controller()`, `insert()`, `get()`, `clone_unique()`, `take_unique()`, `transfer()`, `into_parts()`, `map()`, `try_map()`
-- `StreamContext` for detached context sharing (no value, only metadata)
-- `Registry` with type-erased `std::any`-like storage supporting shared and unique ownership
-- `IntoContext` concept
-
-**Rationale**: `Context<T>` is the heart of the pipeline — it carries the request value, metadata, and lifecycle state through every pipeline stage. Without it, there is no pipeline.
-**Dependencies**: 0.1.
-**Complexity**: M — template metaprogramming for type-erased registry, async channel for Controller.
-**Implementation order**: **7**.
-
-### 4.2 Implement `Source`, `Sink`, `Edge`, `Operator` pipeline nodes
-**Rust**: `pipeline/nodes.rs:351L`
-**C++**: ❌ Stub file only.
-
-**What to add**: Full pipeline node types in `<dynamo/pipeline/nodes.h>`:
-- `Source<T>` — emits data downstream via `on_next()`, `set_edge()`, `link(Sink)`
-- `Sink<T>` — receives data via `on_data()`
-- `Edge<T>` — typed connection between `Source` and `Sink`
-- `Operator<UI,UO,DI,DO>` — bidirectional transform: `forward(UpIn) -> DownIn`, `backward(DownOut) -> UpOut`
-- `PipelineOperator<...>` — wraps an `Operator`, exposes forward/backward edges
-- `PipelineNode<In,Out>` — simple unidirectional transform
-- `ServiceFrontend<In,Out>` / `ServiceBackend<In,Out>` — pipeline entry/exit points
-
-**Rationale**: Without these, the pipeline is just a concept document. These types make the pipeline executable.
-**Dependencies**: 4.1 (Context).
-**Complexity**: M — template-heavy, but straightforward port from Rust.
-**Implementation order**: **7** (parallel with 4.1).
-
-### 4.3 Implement `AsyncEngine` hierarchy
-**Rust**: `engine.rs:168L`
-**C++**: ⚠️ `engine.h` attempts this but header doesn't exist.
-
-**What to add**: Create `<dynamo/engine.h>` with:
-- `Data` concept (C++20 concept: `std::movable && std::destructible`)
-- `AsyncEngineContext` interface (not just a class — Rust has `dyn AsyncEngineContext`)
-- `AsyncEngineContextProvider` trait
-- `AsyncEngine<Req, Resp, E>` abstract class with `virtual Task<void> generate(Req, ResponseStream<Resp>) = 0`
-- `AsyncEngineUnary<Resp>` — a `SemiFuture<Resp>` + context
-- `AsyncEngineStream<Resp>` — an `AsyncGenerator<Resp>` + context
-- `ResponseStream<R>` — wraps data stream + context, Stream impl
-
-**Rationale**: `AsyncEngine` is the fundamental execution trait in Dynamo. Every component, pipeline node, client, and backend implements it. Without it, nothing can be composed.
-**Dependencies**: 4.1 (Context).
-**Complexity**: M — template concepts, Folly coro integration.
-**Implementation order**: **7** (parallel with 4.1, 4.2).
-
----
-
-## Phase 5: LLM Layer (Order: 5)
-
-### 5.1 Implement `Annotated<T>` envelope
-**Rust**: `protocols/annotated.rs:168L`
-**C++**: ❌ Missing.
-
-**What to add**: `<dynamo/protocols/annotated.h>` with:
-- `Annotated<T>` struct: `data: optional<T>`, `id: string`, `event: optional<string>`, `comment: optional<string>`
-- `static from_data(T)`, `from_error(error)`, `from_event(string)`, `from_annotation(name, value)`
-- `is_ok()`, `is_err()`, `is_event()`, `is_error()`
-- `transfer(U) -> Annotated<U>`, `map_data(F) -> Annotated<U>`
-- `into_result() -> Result<optional<T>, Error>`
-
-**Rationale**: `Annotated<T>` is the universal response envelope used by SSE streaming, error propagation, and pipeline outputs. Without it, streaming responses lack metadata.
-**Dependencies**: None.
-**Complexity**: S — header-only template class.
-**Implementation order**: **8**.
-
-### 5.2 Add `Usage` struct and `ContentProvider` trait
-**Rust**: `llm/protocols.rs:76L`
-**C++**: ❌ Missing.
-
-**What to add**:
-- `struct Usage { int prompt_tokens, completion_tokens, total_tokens; }` with `to_json`/`from_json`
-- `struct ContentProvider` concept — `fn content(&self) -> std::string`
-
-**Rationale**: The OpenAI API returns `Usage` in every response. `ContentProvider` is used for extracting text from response choices.
-**Dependencies**: 5.1.
-**Complexity**: XS.
-**Implementation order**: **8** (parallel with 5.1).
-
-### 5.3 Add SSE codec: `convert_sse_stream()`
-**Rust**: `llm/protocols.rs:76L` — `convert_sse_stream(stream) -> DataStream<Annotated<R>>`
-**C++**: ❌ Missing — HTTP server does manual SSE formatting.
-
-**What to add**: A reusable SSE codec:
-- `SSEEncoder` class: `encode(Annotated<T>) -> string` (formats `data: ...\n\n`)
-- `SSEDecoder` class: `decode(string_view) -> optional<Annotated<json>>` (parses SSE frames)
-- `convert_to_sse_stream(AsyncGenerator<Annotated<T>>) -> AsyncGenerator<string>`
-
-**Rationale**: SSE is how OpenAI-compatible streaming works. The HTTP server currently hardcodes SSE formatting. A reusable codec enables testing and reuse.
-**Dependencies**: 5.1.
-**Complexity**: S — parsing/formatting logic.
-**Implementation order**: **8**.
-
-### 5.4 Integrate HuggingFace Tokenizer or equivalent
-**Rust**: `tokenizers.rs:570L` — HuggingFace + SentencePiece wrappers
-**C++**: ⚠️ `SimpleTokenizer` — character-level demo only.
-
-**What to add**:
-- Option A: Use `sentencepiece` C++ library (if available) or `huggingface/tokenizers` Rust FFI (complex)
-- Option B: Implement a minimal BPE tokenizer that can load a merged BPE vocab + merges file (simpler but limited)
-- `Tokenizer` abstract class with `encode()`, `decode()`, `encode_batch()`, `decode_batch()`
-- `HuggingFaceTokenizer` wrapper loading `tokenizer.json` files
-- `DecodeStream` — stateful incremental decoder (`add_token(id) -> optional<string>`)
-- `StopSequenceDecoder` with visible/hidden stop tokens and sequences, builder pattern
-
-**Rationale**: Tokenization is essential for any LLM serving. `SimpleTokenizer` is a placeholder that can't serve real models. Without proper tokenization, the LLM examples are non-functional.
-**Dependencies**: 5.1.
-**Complexity**: XL — HuggingFace tokenizer is complex. SentencePiece is easier but still significant. Option B (minimal BPE) is M.
-**Implementation order**: **9**.
-
-### 5.5 Wire `Backend` as a pipeline `Operator`
-**Rust**: `backend.rs:508L` — Backend implements `Operator<BackendInput, BackendOutput, BackendInput, LLMEngineOutput>`
-**C++**: `Backend` is a standalone abstract class, not a pipeline operator.
-
-**What to add**: Make `Backend` implement `Operator`:
-- `Backend::forward(BackendInput) -> BackendInput` (pass-through)
-- `Backend::backward(LLMEngineOutput) -> BackendOutput` (decode tokens, check stop conditions)
-- Integrate `Decoder` as the stop-condition-checking step in the backward path
-- Add `StepResult` / `SeqResult` / `StopTrigger` types for more diagnostic information
-
-**Rationale**: The Rust `Backend` is a pipeline `Operator`. Making it an operator allows it to be composed in pipelines naturally.
-**Dependencies**: 4.2 (Operator), 5.4 (tokenizer).
-**Complexity**: M — port from Rust's backend.rs.
-**Implementation order**: **10**.
-
-### 5.6 Add KV router metrics aggregation + scoring
-**Rust**: `kv_router/indexer.rs`, `kv_router/metrics_aggregator.rs`, `kv_router/scheduler.rs`, `kv_router/publisher.rs`, `kv_router/scoring.rs`
-**C++**: ⚠️ `KvIndexer` exists, `KvRouter` exists, but no metrics/scheduler/publisher/scoring.
-
-**What to add**:
-- `KvMetricsAggregator` — collects `load_factor`, `kv_cache_usage_pct` from worker heartbeats
-- `KvScheduler` — takes indexer scores + metrics → final decision
-- `KvScorer` — cost function: `(KV match ratio) - (load_factor * weight) + (cache_usage * weight)`
-- `KvPublisher` — publishes KV events to the event bus (gRPC broadcast)
-- Subscribe to KV events from workers and update the indexer
-
-**Rationale**: Without metrics aggregation, the router schedules based on prefix match alone — ignoring load, which is the whole point of KV-aware routing.
-**Dependencies**: 3.1 (real etcd for event bus).
-**Complexity**: L — event subscription, metrics collection, configurable scoring weights.
-**Implementation order**: **11**.
-
-### 5.7 Disaggregated router with etcd config watcher
-**Rust**: `disagg_router.rs:259L` — `new_with_etcd_and_default()`, `start_config_watcher()`, `check_for_updates()`
-**C++**: ⚠️ Simple boolean decision, no dynamic config.
-
-**What to add**:
-- `DisaggregatedRouter::new_with_etcd(drt, model_name, default)` — reads config from `etcd:/dynamo/disagg_router/models/{model_name}`
-- `start_config_watcher()` — etcd prefix watch → `reconfigure()`
-- `get_model_name()` accessor
-
-**Rationale**: The whole point of disaggregated routing is runtime configurability. Without etcd watching, the config is static.
-**Dependencies**: 3.2 (etcd watcher).
-**Complexity**: S — mostly wrapping etcd watcher + calling `reconfigure()`.
-**Implementation order**: **11** (parallel with 5.6).
-
----
-
-## Phase 6: Network Transport (Order: 6)
-
-### 6.1 Implement gRPC `EndpointService` handler
-**Rust**: NATS-based `PushEndpoint` + two-part message dispatch
-**C++**: ❌ Missing.
-
-**What to add**: Implement the `EndpointService::Call` bidirectional streaming RPC from `runtime.proto`:
-- Receives `EndpointMessage` from clients
-- Demultiplexes by `endpoint_name` to the correct pipeline
-- Returns `EndpointMessage` responses with stream control
-- Handles `ControlMessage::STOP`, `KILL`, `SENTINEL`
-
-This replaces the NATS `PushEndpoint` + `AddressedPushRouter` pattern from Rust.
-
-**Rationale**: Without this, gRPC transport is a stub — no actual RPC happens.
-**Dependencies**: 0.2 (protobuf), 2.2 (EndpointConfig).
-**Complexity**: L — gRPC bidirectional streaming, endpoint routing, control message handling.
-**Implementation order**: **12**.
-
-### 6.2 Implement gRPC `LLMService` handler
-**Rust**: Various engine backends (vLLM, TRT-LLM, etc.)
-**C++**: ❌ Missing.
-
-**What to add**: Implement the `LLMService::Generate` server-streaming RPC from `llm.proto`:
-- Takes `GenerateRequest` (model, input_ids, params)
-- Returns stream of `GenerateResponse` (token_id, finished, finish_reason)
-- Delegates to `Backend::generate()`
-
-**Rationale**: This is the primary serving API. Without it, clients can't send generation requests.
-**Dependencies**: 0.2 (protobuf), 5.5 (Backend as Operator).
-**Complexity**: M — streaming RPC handler, token streaming.
-**Implementation order**: **12** (parallel with 6.1).
-
-### 6.3 Implement gRPC client-side load balancing for `EndpointService`
-**Rust**: `component/client.rs` — round_robin/random/direct
-**C++**: ❌ Missing.
-
-**What to add**: `GrpcEndpointClient<Req, Resp>` class that:
-- Maintains a list of discovered gRPC endpoints
-- Creates/reuses gRPC stubs per endpoint
-- Implements round-robin/random/direct routing strategies
-- Watches for endpoint changes (etcd → update routing table)
-- Thread-safe, lock-free or fine-grained locking
-
-**Rationale**: Without client-side LB, the gRPC client hits a single endpoint. This is the C++ equivalent of the Rust `Client` struct but using gRPC channels instead of NATS subjects.
-**Dependencies**: 3.1 (real etcd), 3.3 (etcd watcher), 6.1 (EndpointService).
-**Complexity**: L — stub pool management, health checking, reconnection.
-**Implementation order**: **13**.
-
----
-
-## Phase 7: HTTP & API Completeness (Order: 7)
-
-### 7.1 Full OpenAI-compatible HTTP API
-**Rust**: `components/http/` — axum-based with `/v1/chat/completions`, `/v1/completions`, `/v1/models`
-**C++**: ⚠️ `http/server.cpp` — basic asio HTTP/1.1, only `/v1/completions`.
-
-**What to add**:
-- `/v1/chat/completions` — takes `ChatCompletionRequest`, returns SSE stream of `ChatCompletionResponse`
-- `/v1/completions` — takes `CompletionRequest`, returns SSE stream of `CompletionResponse`
-- `/v1/models` — returns model list queried from etcd registrations
-- Proper HTTP routing (not raw asio; use a library or add a simple router)
-- Content-Type negotiation, error responses with OpenAI-compatible error format
-- CORS headers for web clients
-
-**Rationale**: The HTTP component is the primary user-facing API for Dynamo. Without full OpenAI compatibility, users can't use standard client libraries.
-**Dependencies**: 6.2 (LLMService), 5.3 (SSE codec).
-**Complexity**: L — HTTP routing, SSE streaming, model listing, error formatting.
-**Implementation order**: **14**.
-
-### 7.2 OpenAI-compatible error format
-**Rust**: Uses `http-api-problem` crate for RFC 7807 problem details
-**C++**: ❌ Returns raw exception strings.
-
-**What to add**: Standard error response format:
-- `{"error": {"message": "...", "type": "...", "param": null, "code": null}}`
-- Error types: `invalid_request_error`, `server_error`, `rate_limit_error`, etc.
-
-**Rationale**: OpenAI API clients parse this specific error format.
-**Dependencies**: 7.1.
-**Complexity**: XS.
-**Implementation order**: **14** (parallel with 7.1).
-
----
-
-## Phase 8: Testing & Validation (Order: 8)
-
-### 8.1 Integration tests with gRPC end-to-end
-**Rust**: Integration tests in `dynamo/tests/` (workflow tests)
-**C++**: ❌ No integration tests.
-
-**What to add**: Integration tests that:
-- Start `DistributedRuntime` with in-memory etcd
-- Create two components (server + client) on different "nodes"
-- Register endpoints, discover each other
-- Send a request through the pipeline and verify the response
-
-**Rationale**: Without integration tests, there's no assurance the components work together.
-**Dependencies**: Everything in phases 1–6.
-**Complexity**: M — test fixtures, process/thread management.
-**Implementation order**: **15**.
-
-### 8.2 Performance benchmarks
-**Rust**: Uses `criterion` for benchmarks
-**C++**: ❌ Missing.
-
-**What to add**: Google Benchmark (or folly Benchmark) tests for:
-- Pipeline throughput (Context creation, transfer, map)
-- gRPC round-trip latency
-- TCP call-home throughput
-- Tokenizer encode/decode throughput
-- Router scheduling latency
-
-**Rationale**: Dynamo is a performance-critical system. Without benchmarks, regressions can't be detected.
-**Dependencies**: All modules must be functional.
-**Complexity**: M — benchmark setup, statistical analysis.
-**Implementation order**: **16**.
-
-### 8.3 Testing with real etcd (docker-compose)
-**Rust**: `deploy/docker-compose.yml` — etcd + NATS + Prometheus + Grafana
-**C++**: ❌ Missing.
-
-**What to add**: `docker-compose.yml` for test infrastructure:
-- etcd (for real integration tests)
-- gRPC reflection (for debugging)
-- Optionally: Grafana + Prometheus for metrics
-
-**Rationale**: In-memory etcd is fine for unit tests but distributed features need real etcd.
-**Dependencies**: 3.1 (real etcd client).
-**Complexity**: S — docker-compose file + CI integration.
-**Implementation order**: **15** (parallel with 8.1).
-
----
-
-## Phase 9: Production Polish (Order: 9)
-
-### 9.1 Metrics and observability
-**Rust**: `components/metrics/` — Prometheus metrics with OpenTelemetry
-**C++**: ❌ Missing.
-
-**What to add**: Prometheus metrics via `prometheus-cpp`:
-- `dynamo_requests_total` counter
-- `dynamo_request_duration_seconds` histogram
-- `dynamo_tokens_generated_total` counter
-- `dynamo_active_requests` gauge
-- Metrics HTTP endpoint for Prometheus scraping
-
-**Rationale**: Without metrics, operators can't observe system behavior.
-**Dependencies**: 6.1, 6.2 (gRPC services).
-**Complexity**: M — metrics collection, HTTP exposition endpoint.
-**Implementation order**: **17**.
-
-### 9.2 Structured logging / tracing
-**Rust**: `tracing` crate with structured fields and spans
-**C++**: ⚠️ `spdlog` basic logging.
-
-**What to add**:
-- Structured log fields (request_id, component, endpoint, duration)
-- Trace context propagation through gRPC metadata
-- Configurable log level per-module
-- JSON log output (for log aggregation systems)
-
-**Rationale**: Structured logging is essential for debugging distributed systems.
-**Dependencies**: None.
-**Complexity**: S — spdlog already handles most of this; just need convention and propagation.
-**Implementation order**: **17** (parallel with 9.1).
-
-### 9.3 Graceful shutdown with drain
-**Rust**: `worker.rs` — signal → start drain → stop accepting → wait for inflight → shutdown
-**C++**: ❌ Missing.
-
-**What to add**: Shutdown sequence:
-1. Signal received (or `Runtime::shutdown()` called)
-2. Stop accepting new gRPC connections
-3. Send `ControlMessage::STOP` to inflight streams
-4. Wait for inflight streams to complete (with timeout)
-5. `CancellationToken::cancel()` → cascade to all children
-6. Join all thread pools
-
-**Rationale**: Without graceful draining, in-flight requests are aborted and clients see errors during rolling updates.
-**Dependencies**: 1.4 (Worker), 6.1 (gRPC services).
-**Complexity**: M — drain orchestration, stream tracking.
-**Implementation order**: **18**.
-
-### 9.4 `llmctl` equivalent — CLI for deployment management
-**Rust**: `launch/llmctl/` — CLI tool using `clap` + `tabled`
-**C++**: ❌ Missing.
-
-**What to add**: A CLI tool that:
-- Lists registered components/endpoints via etcd
-- Shows model deployment cards
-- Controls per-endpoint configuration
-- Tabular output via `tabulate` or similar
-
-**Rationale**: Operators need a way to inspect and control deployments.
-**Dependencies**: 3.1 (real etcd).
-**Complexity**: M — CLI framework, etcd queries, table formatting.
-**Implementation order**: **19**.
-
----
-
-## Summary Table
-
-| Phase | Items | Complexity | Order |
-|---|---|---|---|
-| **0: Make it compile** | 0.1–0.3 | XL | **0 — MUST GO FIRST** |
-| **1: Core Runtime** | 1.1–1.5 | M | **1** |
-| **2: Component Model** | 2.1–2.4 | L | **2** |
-| **3: Transport & Discovery** | 3.1–3.4 | XL | **3** |
-| **4: Pipeline Execution** | 4.1–4.3 | L | **4** |
-| **5: LLM Layer** | 5.1–5.7 | XL | **5** |
-| **6: Network Transport** | 6.1–6.3 | L | **6** |
-| **7: HTTP & API** | 7.1–7.2 | L | **7** |
-| **8: Testing** | 8.1–8.3 | M | **8** |
-| **9: Production Polish** | 9.1–9.4 | L | **9** |
-
-Total estimated complexity to reach parity with the Rust codebase: ~25–30 new files, ~15,000–20,000 lines of C++ code beyond the current ~2,000 lines. This reflects the Rust codebase's ~30,000 lines of implementation code (excluding vendored/third-party code).
-
-**Key differentiator vs Rust**: The gRPC-for-NATS replacement (items 6.1, 6.3, 3.1–3.3) is the single largest deviation. In Rust, NATS handles ~80% of the networking complexity. In C++, gRPC fills this role but requires explicit implementation of endpoint discovery, load balancing, and streaming control that NATS provides for free.
+## 1. Execution model & pipeline (`src/pipeline/`)
+
+- [x] **P0 — Unary responses (`SingleIn → SingleOut`).** *(done)*
+  `pipeline::make_unary_engine<Req,Resp>(fn)` adapts a value-returning handler
+  into a one-item-stream engine; `Client::unary()` dispatches with
+  `response_type: single_out` and resolves to the single value;
+  `EngineIngress` cuts the stream after the first item for unary requests
+  (works against streaming engines too). Note: a distinct `SingleOut` engine
+  *type* was not added — Dynamo's own network layer only ships
+  `SingleIn/ManyOut` handlers, so unary is a wire/consumption shape here, not
+  a separate engine hierarchy. Tests: `[endpoint][unary]` ×2.
+
+- [x] **P1 — Context registry and stage tracking.** *(done)*
+  `pipeline::ContextRegistry` (typed shared + take-once unique entries),
+  `Context::registry()`, `stages()/add_stage()`, and `map()` — all carried
+  across `transfer()`/`map()`. Tests: `[pipeline][context]`.
+
+- [x] **P1 — Composable pipeline node graph.** *(done)*
+  `pipeline/operators.h`: `Operator` (bidirectional transform with the
+  downstream engine as its forward edge), `link()` composing operators into
+  plain engines, `make_map_operator` (PipelineNode role, records its stage on
+  the context trail). Segment boundaries are `Client::as_engine()` (caller
+  side) + `Endpoint::serve()` (worker side) — validated locally, multi-stage,
+  and across the network. Example: `echo_pipeline`; tests:
+  `[pipeline][operators]`, `[endpoint][operators]`. Note: kept engine-shaped
+  rather than porting Rust's Source/Sink/Edge trait machinery — same
+  composition power, idiomatic to our AsyncEngine model.
+
+- [x] **P2 — `ManyIn` request streams.** *(done: explicit rejection)*
+  Decision: not implemented (matching Dynamo, whose handler is a stub), but
+  now rejected loudly at both layers — the ingress fails the call fast via a
+  prologue error ("request_type 'many_in' is not supported"), and the data
+  plane rejects Request-type call-home handshakes. Test: `[endpoint][manyin]`.
+
+- [x] **P2 — Stream utilities.** *(done)*
+  `coro/utils.h`: `until_deadline`/`until_timeout` generator adaptors
+  (checked between items, matching the Rust adaptor's poll semantics) and
+  `Pool<T>` with RAII `Item` handles, `on_return` reset, and `take()`
+  detachment. Tests: `[coro][utils]`.
+
+## 2. Component & service layer (`src/component/`)
+
+- [x] **P0 — Cluster-wide stats collection (`scrape_stats(duration)`).** *(done)*
+  `Component::scrape_stats(timeout)` enumerates all live instances of the
+  component from discovery, fans out concurrent control-plane stats queries
+  (each bounded by `timeout` via SO_RCVTIMEO on the ack read), and returns a
+  `ServiceSet` of per-instance `EndpointStats` (unreachable instances are
+  reported per-entry, not thrown). Test:
+  "component-wide stats scrape aggregates all instances".
+  Follow-up completed with the P1 batch: `examples/service_metrics` ported
+  (custom stats handler + component-wide scrape, printed per instance).
+
+- [x] **P1 — Stop instance watchers when the last client is gone.** *(done)*
+  The registry now holds `weak_ptr<InstanceSource>`; the last client dropping
+  the source closes the watch receiver (ending the fold loop and the
+  server-side watch), and a later client recreates it. Test:
+  "instance watch closes when the last client drops".
+
+- [x] **P1 — Service/endpoint description metadata.** *(done)*
+  `serve()` now takes `ServeOptions{lease, stats_handler, description,
+  version}`; description/version are registered in `EndpointInfo` (parsing is
+  default-tolerant) and visible via `Client::instances()` / scrapes. Test:
+  `[endpoint][metadata]`.
+
+- [x] **P2 — `Component::list_endpoints` / instance enumeration API.** *(done)*
+  `Component::list_instances()` returns every live `EndpointInfo` across the
+  component's endpoints; `scrape_stats` now builds on it. Its test tripped a
+  real bug: fluent-chain member coroutines dangled `this` when called on
+  temporaries (`component.endpoint("x").serve(...)`) — the whole fluent
+  surface (serve/client/publish/subscribe/scrape/list/instance_source/
+  primary_lease) now copies handles into free-coroutine frames eagerly.
+
+- [ ] **P3 — Shared work-queue dispatch (queue groups).**
+  Documented assumption: NATS queue-group load balancing is not reproduced
+  (client-side routing covers Dynamo's actual usage). Rust has a placeholder
+  (`egress/queue.rs`, 14 lines). If ever needed: a broker-side queue in
+  discoveryd or a worker-pull mode on the control plane.
+
+## 3. Local runtime & worker (`src/runtime/`)
+
+- [x] **P0 — Enforce single Worker per process.** *(done)*
+  Constructing a second Worker while one is alive throws (process-wide atomic
+  slot claimed before any pools are created); `execute()` is one-shot
+  (`std::logic_error` on reuse); Worker is non-copyable/non-movable.
+  Deliberate deviation from Rust: a new Worker may be created after the
+  previous one is destroyed (our runtimes are self-contained; Rust's
+  process-global tokio runtime forces ever-once semantics). Tests:
+  "only one worker may be alive; execute is one-shot".
+
+- [x] **P1 — Config layering (TOML + env).** *(done)*
+  `DYN_CONFIG` names a TOML file; `config_or(table, key, fallback)` layers
+  `[runtime]` (worker_threads, background_threads, graceful_shutdown_timeout_s)
+  under env overrides; `env_is_truthy` ported. Test: `[runtime][config]`.
+  `[distributed]` table keys can be added the same way as needed.
+
+- [x] **P1 — Task handles (`runnable.rs::ExecutionHandle`).** *(done)*
+  `Runtime::spawn`/`spawn_background` return a `TaskHandle` (finished(),
+  awaitable `join()` rethrowing failures, blocking `sync_join(timeout)`).
+  serve() registration failures are now observable ("serve failures are
+  observable through the task handle" test). Cancellation stays cooperative
+  via tokens (no abort-by-handle — matches our cancellation model). Fixing
+  this also surfaced and fixed a real teardown race: the spawned frame's
+  tracker guard fired before the inner task frame was destroyed, allowing a
+  pool thread to hold the last Runtime reference and self-join in
+  ~ThreadPool.
+
+- [x] **P1 — Structured logging parity (partial).** *(done, descoped)*
+  `DYN_LOGGING_JSONL` (JSONL pattern; note: message bodies are not
+  JSON-escaped — custom formatter is future work) and
+  `DYN_LOGGING_DISABLE_ANSI`; `DYN_LOG` unchanged. Per-module level filters
+  deliberately descoped: all call sites use spdlog's default logger, so
+  module-scoped filtering needs a logger-per-module refactor first (folded
+  into P2 if ever needed).
+
+- [x] **P2 — External-executor runtimes.** *(done)*
+  `Executor` interface (post + schedule awaitable); `ThreadPool` implements
+  it; `ExternalExecutor` adapts an application post-fn;
+  `Runtime::from_executors(primary, secondary = primary)`. All internal APIs
+  (resume_on, wait_for, spawn_detached, signal pools) now take `Executor&`.
+  Test: `[runtime][executors]`.
+
+- [x] **P2 — Inline-resume policy for events/hooks.** *(done)*
+  `AsyncEvent::set_resume_hook` routes waiter resumption;
+  `Controller::set_signal_executor(post)` routes stop/kill event waiters AND
+  registered hooks; `EngineIngress` sets it to the primary pool, so engines
+  awaiting `stopped()/killed()` never run on transport threads.
+  `CancellationToken` callbacks remain inline by design (they are used for
+  lightweight teardown like channel closes; documented). Test:
+  "async event resume hook routes waiters".
+
+## 4. Discovery (`src/discovery/`)
+
+- [x] **P0 — Keep-alive retry-until-deadline semantics.** *(done)*
+  `keep_alive_loop` now tracks `deadline = now + ttl`, resets it on every
+  successful heartbeat, and retries failures at `min(ttl/4, 500ms)` until the
+  deadline passes; only then (or on an authoritative "lease expired" reply)
+  is the token cancelled. Connection loss no longer insta-cancels leases
+  (`on_connection_lost` drops pending/watches only) — the deadline governs,
+  mirroring the server-side TTL reaper. Full validation of the
+  survive-a-transient-blip path needs client reconnect (P1 below); the
+  TTL-expiry test still covers the lapse path.
+
+- [x] **P1 — Discovery client reconnect.** *(done)*
+  A manager thread owns the connection: reconnects with backoff (200ms→2s),
+  re-registers watches and event subscriptions, and resyncs watches via the
+  server's snapshot + sync-marker protocol (replayed puts are idempotent;
+  deletes missed during the outage are synthesized by diffing the folded key
+  set against the snapshot; stale sync markers are ignored). Leases ride
+  through blips shorter than their TTL via the P0 keep-alive deadline.
+  Tests: "[discovery][tcp][reconnect]" ×2 (resync correctness incl. a delete
+  during the outage; lease survival through a blip).
+
+- [x] **P2 — Watch revisions.** *(done)*
+  Monotonic store revision in both backends; `KeyValue.mod_revision` carried
+  in events and `get_prefix`; discoveryd keeps a bounded event log (4096) and
+  supports `watch(prefix, from_rev)`: incremental replay when the log covers
+  the gap, snapshot + diff fallback otherwise (sync markers now carry
+  `mode: replay|snapshot`). Reconnecting clients resync from their last seen
+  revision automatically. `prev_key` values are not retained (no user yet).
+  Tests: `[discovery][kv]`, reconnect suite.
+
+- [x] **P2 — `kv_put` / `kv_create_or_validate`.** *(done)*
+  Both ops in the `Discovery` interface, the in-process store, discoveryd,
+  and the TCP client. `kv_put` upserts and rebinds the lease (revocation then
+  deletes the key); create_or_validate succeeds iff absent or identical.
+  Tests: `[discovery][kv]` ×2 (both backends).
+
+- [ ] **P3 — Real etcd/NATS backends.**
+  `Discovery` is an interface precisely so an `EtcdDiscovery` (grpc + protobuf
+  submodules are already declared in `.gitmodules`) can slot in later; same
+  for a NATS-based control plane. Large dependency cost; only if deployment
+  requires interop with an existing etcd/NATS cluster.
+
+- [ ] **P3 — discoveryd HA/persistence.**
+  Single-node, in-memory only. Snapshot/restore or raft is out of scope for
+  now; document it as a deliberate limitation in docs/architecture.md.
+
+## 5. Transports (`src/transports/`)
+
+- [x] **P1 — Control-plane connection reuse.** *(done)*
+  The server now serves multiple requests per connection; the client keeps a
+  per-target idle pool (max 8), with stale pooled connections detected via a
+  retry-once-with-fresh-connection path. Idle-timeout eviction left to P2
+  (bounded pool size caps the cost).
+
+- [x] **P1 — Timeouts on the request path.** *(done)*
+  `CallOptions{dispatch_timeout (ack, default 5s), arrival_timeout (call-home,
+  default 30s)}`; the arrival timeout injects a synthetic StreamArrival via a
+  timer and deregisters the pending subject, failing generate() with a clear
+  error. Test: "arrival timeout fails the call when a worker acks but never
+  calls home". Remaining nuance for P2: the TCP connect() itself is still
+  blocking without its own deadline (local networks make this a non-issue
+  today).
+
+- [x] **P1 — Configurable stream buffering (`StreamOptions`).** *(done)*
+  `CallOptions::recv_buffer_count` (default 64) flows through
+  `Client` → `register_response_stream` → the per-stream channel.
+  `send_buffer_count` has no equivalent here (worker-side sends are direct
+  framed writes with socket backpressure, no intermediate queue).
+
+- [x] **P2 — Data-plane connection sharing.** *(resolved by measurement: keep as-is)*
+  `dynamo_bench` (Release, loopback): unary calls with FULL per-call stream
+  setup (dispatch + call-home connect + teardown) run at ~4.1k req/s with
+  p50 239µs / p99 315µs; single-stream throughput ~159k items/s (40.7 MB/s
+  at 256B items); codec ~366k msg/s. Stream setup is sub-millisecond and not
+  a bottleneck for inference-shaped workloads — per-stream connections stay
+  (simpler failure isolation). Revisit only if a workload needs >>4k new
+  streams/s per node.
+
+- [x] **P2 — Codec hardening.** *(done)*
+  Inbound cap configurable via `Socket::set_max_frame_bytes` /
+  `DYN_MAX_FRAME_MB` (default 256 MiB). `tests/codec_test.cpp` covers
+  roundtrips (incl. binary payloads) and malformed input (truncated prelude/
+  body, trailing garbage, corrupt checksum, corrupt length, oversize); an
+  endpoint test feeds raw garbage to a live control plane and verifies the
+  server keeps serving.
+
+- [ ] **P3 — TLS/authentication.**
+  Nothing on any socket (Dynamo delegates this to etcd/NATS deployment
+  options). Would need a TLS wrapper around `Socket` and token auth on
+  discoveryd/control plane.
+
+- [ ] **P3 — ZMQ-style transport (`transports/zmq.rs`, 418 lines).**
+  Alternative data-plane transport in Rust (used by some deployments). Our
+  transport interfaces would host it as another `StreamSender`/receiver pair;
+  skip unless a concrete need appears.
+
+## 6. Eventing (`src/traits` equivalent — missing entirely)
+
+- [x] **P1 — `EventPublisher`/`EventSubscriber`.** *(done)*
+  `Discovery::publish/subscribe` (exact-subject transient events) implemented
+  in both backends — discoveryd carries subscribe/unsubscribe/publish ops and
+  fans out to subscribers; subscriptions survive reconnects (re-registered by
+  the manager thread). `Namespace`/`Component` expose
+  `publish(name, json)` / `subscribe(name)` on Dynamo's subject scheme
+  (`{ns}.events.{name}` / `{ns}.{comp}.events.{name}`). Tests:
+  `[discovery][events]` ×2, `[endpoint][events]`.
+
+## 7. Tests, examples, tooling
+
+- [x] **P1 — Multi-process integration test.** *(done)*
+  `tests/integration/multi_process.sh` (ctest: `multi_process_integration`,
+  label `integration`, serial): discoveryd + server + client as separate
+  processes; asserts registration (via the new `instance_ls` tool), the
+  streamed "hello world", then SIGKILLs the server and asserts TTL-based
+  disappearance (~12s).
+
+- [x] **P1 — Port Dynamo's `tests/soak.rs`.** *(done, CI-sized)*
+  `tests/soak_test.cpp` ([soak]): 8 concurrent clients × 25 streaming
+  requests round-robining over two stable instances while a third instance
+  churns (serve → revoke ×6). Asserts zero payload corruption and full
+  accounting (completions + clean routing errors). Runs in ~2s, so it stays
+  in the default suite; scale the constants up for a real soak run.
+
+- [x] **P2 — Graceful-shutdown timeout (911) subprocess test.** *(done)*
+  `tests/helpers/hang_worker` + `integration/graceful_timeout.sh` (ctest:
+  `graceful_timeout_911`): SIGTERM with a 1s window, asserts exit status 143
+  (Unix truncates 911 to 8 bits — same observable as Rust's worker).
+
+- [x] **P2 — Throughput/latency microbenchmarks.** *(done)*
+  `dynamo_bench` example binary: codec encode+decode, unary req/s with
+  latency percentiles, and single-stream item throughput. Baseline numbers
+  recorded in the data-plane-sharing entry above.
+
+- [x] **P2 — CI workflow.** *(done, unverified on Linux)*
+  `.github/workflows/ci.yml`: {macos-14, ubuntu-24.04} × {default, asan,
+  release} presets; fetches the non-gitlink deps explicitly (the dynamo
+  reference repo is not needed to build). The code is POSIX-portable by
+  construction but has only been executed on macOS here — expect the first
+  Linux CI run to shake out minor include/flag nits.
+
+## 8. LLM layer milestones (`src/llm/`)
+
+Port of `third_party/dynamo/lib/llm` (~25k lines Rust) onto the v2 component
+layer, in dependency order. Partial v1 ports (protocols, tokenizer, router,
+backend, HTTP server) exist in git history (`lib/llm`, `lib/http`, deleted
+2026-07-03) — mine them for reference, but they predate the v2 pipeline
+model and are not drop-in.
+
+### M1 — Protocols (`src/llm/protocols/`) — DONE
+
+- [x] **Common LLM types.** *(done)* `llm/protocols/common.h` (FinishReason
+  with Rust-serde-compatible JSON, StopConditions, SamplingOptions,
+  OutputOptions) and `llm/protocols/llm_backend.h` (PreprocessedRequest =
+  BackendInput, LLMEngineOutput, BackendOutput). Providers are plain
+  functions (`extract_sampling_options`/`extract_stop_conditions`) rather
+  than trait objects. Tests: `[llm][common]`.
+- [x] **OpenAI chat/completions types.** *(done)* `llm/protocols/openai.{h,cpp}`:
+  NvExt (+validation), chat + legacy-completions requests/responses
+  (tolerant parsing: missing/null accepted, unknown fields ignored,
+  string-or-array `stop`, multi-part content flattened), ChatDeltaGenerator /
+  CompletionDeltaGenerator, ChatDeltaAggregator / CompletionDeltaAggregator.
+  Deviations from Rust v0.1.0 (each commented at the site): completions
+  `stop` is honored (Rust drops it), usage.total_tokens is computed (Rust
+  leaves 0), assistant-role-on-every-chunk quirk preserved. Tests:
+  `[llm][openai]` incl. ports of the Rust aggregator tests.
+- [x] **SSE codec.** *(done)* `llm/protocols/sse.{h,cpp}`: incremental
+  SseDecoder (feed/finish), comment/id/event/data fields, multi-line data,
+  `[DONE]` dropped, CRLF tolerated; `encode_sse` for the M5 frontend;
+  `annotated_from_sse<R>` (error events → error annotations). Tests:
+  `[llm][sse]` incl. an abbreviated recorded OpenAI stream fixture.
+- [x] **Token types.** *(done)* `llm/tokens.{h,cpp}`: XXH3-64 seed 1337 over
+  LE token bytes (vendored xxHash, header-only), TokenBlock/TokenSequence
+  with sequence-hash chaining. Golden hashes from the Rust test verified.
+  Quirk preserved: first split block's seq hash = block hash. Deviations:
+  empty input allowed (Rust panics); pushed blocks advance the partial
+  block's parent hash (Rust chains every pushed block to a stale parent).
+  Tests: `[llm][tokens]`.
+
+### M2 — Tokenizers + preprocessor (`src/llm/tokenizers.*`, `src/llm/preprocessor*`) — DONE
+
+- [x] **Tokenizer interface (+reference backend).** *(done; HF backend
+  descoped)* `llm/tokenizers.{h,cpp}`: Encoding, abstract Tokenizer,
+  Sequence (incremental decode, U+FFFD partials held, prefix/read offsets
+  ported exactly), StopSequenceDecoder (visible/hidden stop tokens, hidden
+  stop sequences with Held jail). Backend: ByteLevelTokenizer (byte ids +
+  <s>/</s> specials, lossy UTF-8 decode) — self-contained and exercises the
+  real partial-character paths; a HuggingFace tokenizer.json backend stays
+  descoped until a real engine integration needs it (vendoring
+  tokenizers-cpp pulls a Rust toolchain into the build). Tests:
+  `[llm][tokenizer]`.
+- [x] **Prompt formatting.** *(done)* Vendored google/minja (header-only,
+  SYSTEM include). `llm/preprocessor/prompt.{h,cpp}`: PromptFormatter,
+  HfChatTemplateFormatter (chat_template + bos/eos), `chat_template_input`
+  from chat requests (add_generation_prompt iff last turn is user) and
+  legacy completions (single user turn). Template-corpus validation still
+  worthwhile when real models land. Tests: `[llm][prompt]`.
+- [x] **Preprocessor operator.** *(done)* `llm/preprocessor.{h,cpp}`:
+  OpenAIPreprocessor implements both pipeline Operators (chat + legacy
+  completions): render (nvext.use_raw_prompt honored) → tokenize → extract
+  sampling/stop options → merge model EOS ids into hidden stops →
+  apply_ignore_eos → BackendInput with mdcsum; response side maps
+  BackendOutput deltas through the M1 delta generators, prepends
+  formatted_prompt/token_ids annotations, and on generator error emits an
+  error annotation, stops the context, and closes the stream. Tests:
+  `[llm][preprocessor]` incl. operator e2e via `link()` against an inline
+  backend and the error path.
+
+### M3 — Backend + engine interface (`src/llm/backend.*`, `src/llm/engines.*`) — DONE
+
+- [x] **Backend operator.** *(done)* `llm/backend.{h,cpp}`: Decoder
+  (incremental detokenization via Sequence, hidden stop tokens/sequences,
+  min_tokens gate) + Backend Operator (BackendInput→BackendOutput over an
+  ExecutionContext engine): pass-through for events and text-carrying
+  engine deltas, decode+stop-check for token-only deltas, stop_generating()
+  when the decoder stops a stream the engine did not finish. Deviations
+  from Rust v0.1.0 (commented): partial stop-sequence text is jailed and
+  never leaks (Rust streams it and only cuts after the fact — its own TODO),
+  jailed text is flushed on finish, the engine's finish reason survives when
+  the decoder found none (Rust overwrites it, dropping token-only Length),
+  and the stream is cut locally after a stop trigger. Tests:
+  `[llm][backend]`.
+- [x] **Engine seam + echo engine.** *(done)* `llm/engines.{h,cpp}`:
+  ExecutionContext/ExecutionOutputStream aliases (the engine seam real
+  adapters plug into) and make_echo_engine_core() (dynamo-run echo_core:
+  one token-only delta per request token + a stop delta; extended to honor
+  max_tokens with a length finish and context stop). Full local pipeline
+  test: preprocessor → backend → echo, aggregated to a unary chat response.
+
+### M4 — Model deployment cards (`src/llm/model_card.*`) — DONE
+
+- [x] **MDC model + create.** *(done)* `llm/model_card.{h,cpp}`:
+  ModelDeploymentCard with serde-compatible JSON (externally-tagged
+  artifacts, RFC3339 last_published, revision not serialized),
+  `from_local_path` (config.json + tokenizer.json required,
+  tokenizer_config.json optional), ModelInfo from HF config.json
+  (int-or-array eos), HfTokenizerConfig (chat_template string/named-list,
+  string-or-AddedToken bos/eos), slug + expiry (5 min). Deviations:
+  slug/mdcsum hash with XXH3 instead of blake3 (checksums were never
+  cross-implementation comparable); hf-hub downloading descoped (local
+  paths only). Extension: `byte_level` tokenizer kind so full pipelines run
+  without an HF tokenizer backend. Factories: OpenAIPreprocessor::from_mdc,
+  Backend::from_mdc (+ tokenizer_from_mdc/formatter_from_mdc). Tests:
+  `[llm][mdc]`.
+- [x] **Publish/discover MDCs.** *(done)* `publish_model_card` (kv_put of
+  mdc/{slug} bound to the worker lease, stamps last_published, bumps
+  revision) and `list_model_cards` (prefix get, malformed entries skipped)
+  over the existing Discovery interface; cards disappear with their lease
+  (tested). The M5 frontend watches the same prefix; `instance_ls`-style
+  listing tooling can come with M5's example.
+
+### M5 — HTTP frontend (`src/llm/http/`) — DONE
+
+- [x] **HTTP/1.1 + SSE server.** *(done)* `llm/http/http_server.{h,cpp}`:
+  in-tree minimal HTTP/1.1 on the Socket/Listener stack (no new deps) —
+  exact-path routing, keep-alive, Content-Length bodies (32 MiB cap),
+  chunked streaming responses with a disconnect-aware StreamSink,
+  thread-per-connection with tracked fds joined on stop.
+- [x] **OpenAI routes.** *(done)* `llm/http/service.{h,cpp}`:
+  /v1/chat/completions + /v1/completions (SSE streaming via the M1 codec, or
+  unary via the M1 aggregators), /v1/models, /health; 400/404/500 error
+  JSON; uuid request ids; client disconnect stops the request context.
+  Deviations from Rust v0.1.0 (commented): nvext is preserved (Rust drops
+  it, killing annotations over HTTP); model listing uses object:"model"
+  (Rust emits the literal "object").
+- [x] **Model watch + routing.** *(done)* `llm/http/model_watcher.{h,cpp}`:
+  ModelEntry ({name, endpoint, model_type}) under "{prefix}{type}/{name}",
+  `register_model_entry` (llmctl-style, lease-bound), `run_model_watcher`
+  (prefix watch → component Client::as_engine registered in ModelManager;
+  runtime-shutdown token closes the watch). e2e test: worker serve + entry
+  publish → watcher wires it → HTTP request round-trips through the planes.
+- [x] **Service metrics.** *(done)* Metrics with the Rust label scheme
+  (requests_total{model,endpoint,request_type,status}, inflight gauge,
+  duration histogram) + hand-rolled Prometheus text exposition on /metrics;
+  RAII InflightGuard mirrors the Rust one. Tests: `[llm][http]` (4 cases,
+  ASan-clean).
+
+### M6 — KV-aware routing (`src/llm/kv_router/`) — DONE
+
+- [x] **KV event protocols + publisher.** *(done)*
+  `kv_router/protocols.h`: serde-compatible KvCacheEvent (externally-tagged
+  stored/removed), ForwardPassMetrics, RouterEvent, KVHitRateEvent,
+  `compute_block_hashes_for_seq` (same XXH3-1337 primitive as tokens.h,
+  golden values verified). `kv_router/publisher.{h,cpp}`: KvEventPublisher
+  (component pub/sub on kv_events) and KvMetricsPublisher (latest metrics +
+  load_metrics endpoint whose stats handler feeds scrapes; per-worker lease
+  support).
+- [x] **Radix indexer.** *(done)* `kv_router/indexer.{h,cpp}`: RadixTree
+  (per-worker attribution, engine-hash jump table, parent-based store,
+  remove with children-clear, worker eviction, optional recent-use
+  frequency tracking) + KvIndexer. Deviation: mutex-guarded tree instead of
+  Rust's dedicated thread + channels (its tree is !Send). Tests:
+  `[llm][kv][indexer]` (store/match/extend/unknown-parent/remove/evict).
+- [x] **Scheduler + scoring.** *(done)* `kv_router/scheduler.{h,cpp}`: cost =
+  alpha·load_deviation + (1-alpha)·normalized_new_tokens +
+  gamma·request_load_ratio with balance mode; capacity exclusion;
+  NoEndpoints/AllWorkersBusy errors. Deviations fixing Rust's own FIXMEs
+  (commented): worker_ids aligned with endpoints (Rust's HashSet reorder
+  misindexes), load stats over kv ratios (Rust mixes ratio and absolute
+  units). `kv_router/router.cpp`: metrics aggregator loop on scrape_stats
+  (custom stats under "custom"; worker id = instance id, no subject
+  parsing).
+- [x] **Router integration.** *(done)* `kv_router/router.{h,cpp}`: KvRouter
+  owning indexer + scheduler with spawnable event-consumer and
+  metrics-aggregator tasks (runtime-shutdown aware); `schedule(token_ids)`
+  → hash → overlap → worker id, publishing kv-hit-rate events. The chosen
+  id feeds `Client::direct`. e2e test: two live metrics endpoints, worker B
+  publishes the prompt's blocks, router routes the matching prompt to B
+  (5/5) and still schedules cold prompts; eviction clears affinity. Tests:
+  `[llm][kv]` — all green in Debug, ASan, Release.
+
+## 9. Out of scope (tracked, no milestone)
+
+- **KV block manager + CUDA kernels** (`lib/llm/src/kv/`, 5.5k lines +
+  `block_copy.cu`) — engine-side memory management; needs CUDA and a real
+  engine to matter. Revisit only alongside a native engine integration.
+- **Real engine adapters** (`engines/`: vllm, sglang, trtllm, llamacpp,
+  mistralrs, python — 4.9k lines) — each drags in an SDK or Python interop;
+  M3's engine interface is the seam they'd plug into.
+- **Disaggregated prefill/decode router** (`disagg_router.rs`, 259 lines) —
+  small, but only meaningful with real engines + KV transfer (NIXL).
+- **Python/C bindings** (`lib/bindings`) — needs a stable C ABI over the
+  component layer first; Python is Dynamo's main extensibility surface, so
+  this is the first thing to reconsider if others build on dynamo-cpp.
+- **Launch/deploy tooling** (`dynamo-run`, `llmctl`, `components/http`,
+  `components/metrics`, `deploy/` SDK + k8s operator) — product packaging,
+  not library parity. (`components/http` is the standalone frontend binary
+  over `http/service`; our `src/examples` + M5 service cover the library
+  surface it exercises.)
+
+## 10. Re-audit findings (2026-07-09)
+
+Fresh file-by-file sweep of the Rust tree against `src/`. Everything below is
+either a newly identified open gap (10.1) or Rust code verified to be
+unreachable in v0.1.0 and therefore deliberately not ported (10.2).
+
+### 10.1 Open gaps
+
+- [x] **P2 — Tool-calling chat-template plumbing** *(done)*
+  (`preprocessor/prompt/template/oai.rs`, `formatters.rs`).
+  `NvCreateChatCompletionRequest` now carries `tools`/`tool_choice` (raw
+  JSON, shape-checked: mistyped fields are rejected with a 400 rather than
+  fed to the template); `ChatMessage` carries `tool_calls`/`tool_call_id` so
+  multi-turn tool conversations render faithfully; `chat_template_input()`
+  forwards tools; `HfTokenizerConfig` keeps both `default` and `tool_use`
+  entries of a named-template list; `HfChatTemplateFormatter` renders the
+  `tool_use` template whenever the request carries tools (Rust's
+  `env["tool_use"]` selection). Deviations (commented at the sites):
+  (a) Rust's named-list registration is broken at v0.1.0 — it registers each
+  map's raw k/v pairs, i.e. templates literally named "name"/"template", so
+  `get_template("default")` can never resolve; we implement the HF
+  convention it intended. (b) When tools are present but the config has no
+  distinct `tool_use` template, Rust errors; we render `default` with tools
+  in the context (minja's tool polyfills apply), matching the string-template
+  case. Response-side tool-call *parsing* remains out of scope
+  (`ToolCallingMatcher` is dead code — see 10.2). Tests: `[llm][openai]`
+  round-trip, `[llm][prompt]` ×2, `[llm][mdc]` named-list e2e; 126/126 in
+  Debug/ASan/Release.
+
+- [x] **P3 — Prompt context mixins (`llama3_datetime`)** *(done)*
+  (`preprocessor/prompt/template/context.rs`, `model_card/model.rs`).
+  `HfChatTemplateFormatter` now takes the MDC's `prompt_context` mixin names
+  (wired through `formatter_from_mdc`): `llama3_datetime` injects `datetime`
+  (UTC now as "%d, %B, %Y", locale-independent month names, computed per
+  render like Rust's `Utc::now()` in the mixin) via minja's `extra_context`;
+  `oai_chat` is a recognized no-op (as in Rust, where only the datetime
+  mixin is implemented); unknown names throw at formatter construction
+  (Rust rejects them at MDC deserialization). Tests: `[llm][prompt]` mixin
+  case, `[llm][mdc]` card→formatter e2e; 128/128 in Debug/ASan/Release.
+  Not ported: `unk_token` in the context — minja's chat_template takes only
+  bos/eos; no known template needs it (revisit with a real model corpus).
+
+- **Behavioral difference (documented, no action): unmodeled OpenAI fields
+  are dropped, not preserved.** Rust wraps the full `async-openai` 0.27
+  request/response types, so fields its pipeline never reads (`logit_bias`,
+  `response_format`, `functions`, …) still parse strictly and re-serialize.
+  Our hand-modelled types (`protocols/openai.h`) parse tolerantly and drop
+  unknown fields. Net behavior is identical for every field the Rust
+  pipeline actually consumes (all modeled here); the differences are
+  (a) type errors in unused fields are diagnosed by Rust but ignored here,
+  and (b) middleware that expects unused fields echoed back won't get them.
+  Revisit only if (a) or (b) bites. (`tools`/`tool_choice` were the one
+  unused field pair with a real consumer — the template context — and are
+  now modeled; see the completed P2 above.)
+
+### 10.2 Dead code in Rust v0.1.0 — verified non-gaps, do not port
+
+Each of these is defined but never referenced anywhere in the Rust workspace
+(`lib/`, `components/`, `launch/`) at this commit:
+
+- `preprocessor/tools/` (~200 lines): `ToolCallingMatcher` + tool-call
+  request/response types — response-side tool-call extraction, unused.
+- `protocols/common/postprocessor.rs`: `PostprocessedResponse` — unused.
+- `common/versioned.rs`: `Versioned` trait (NATS atomic-update hook) — unused.
+- `kv_router/worker.rs`: `KvRoutedIngress` — NATS-service ingress wrapper,
+  unused (the kv_router pipeline goes through the normal component ingress).
+- `pipeline/network/egress/queue.rs`: 14-line placeholder (already tracked
+  as the §2 queue-groups P3).

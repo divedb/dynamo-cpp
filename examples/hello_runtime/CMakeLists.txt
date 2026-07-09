@@ -1,2 +1,0 @@
-add_executable(hello_runtime main.cpp)
-target_link_libraries(hello_runtime PRIVATE dynamo_runtime)

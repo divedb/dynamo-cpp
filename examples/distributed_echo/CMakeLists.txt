@@ -1,2 +1,0 @@
-add_executable(distributed_echo main.cpp)
-target_link_libraries(distributed_echo PRIVATE dynamo_runtime dynamo_protos)

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds and tests the three configurations that are run locally:
+# Debug, Debug+ASan/UBSan, and Release (-Werror).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+        preset: [default, asan, release]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only fmt/spdlog are registered gitlinks; the rest are plain clones
+      # (see README). The dynamo reference repo is not needed to build.
+      - name: Fetch dependencies
+        run: |
+          git submodule update --init --depth 1 third_party/fmt third_party/spdlog
+          git clone --depth 1 https://github.com/ToruNiina/toml11.git third_party/toml11
+          git clone --depth 1 https://github.com/nlohmann/json.git third_party/nlohmann_json
+          git clone --depth 1 https://github.com/catchorg/Catch2.git third_party/Catch2
+          git clone --depth 1 https://github.com/Cyan4973/xxHash.git third_party/xxHash
+          git clone --depth 1 https://github.com/google/minja.git third_party/minja
+
+      - name: Install ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build ${{ matrix.preset == 'default' && 'build' || format('build-{0}', matrix.preset) }}
+
+      - name: Test
+        run: ctest --test-dir ${{ matrix.preset == 'default' && 'build' || format('build-{0}', matrix.preset) }} --output-on-failure
