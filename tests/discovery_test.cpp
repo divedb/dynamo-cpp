@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <thread>
 
@@ -215,6 +216,89 @@ TEST_CASE("events: publish reaches current subscribers (in-process)", "[discover
 
   rt.shutdown();
   REQUIRE(rt.join_tasks(2000ms));
+}
+
+TEST_CASE("queue dispatch: one subscriber per item, round-robin, no responders (in-process)",
+          "[discovery][queue]") {
+  auto rt = Runtime::create(test_config());
+  auto store = discovery::InProcessDiscovery::new_store();
+  auto disco = std::make_shared<discovery::InProcessDiscovery>(rt, store);
+
+  coro::sync_wait([&]() -> coro::Task<void> {
+    // Empty group: NATS-style no-responders, nothing buffered.
+    REQUIRE_THROWS_WITH(co_await disco->queue_dispatch("work.q", "lost"),
+                        Catch::Matchers::ContainsSubstring("no responders"));
+
+    auto a = co_await disco->subscribe("work.q");
+    auto b = co_await disco->subscribe("work.q");
+    auto other = co_await disco->subscribe("other.q");
+
+    for (int i = 0; i < 4; ++i) {
+      co_await disco->queue_dispatch("work.q", "item-" + std::to_string(i));
+    }
+
+    // Round-robin: each member saw exactly half, in dispatch order.
+    for (auto* stream : {&a, &b}) {
+      auto first = co_await stream->events.recv();
+      auto second = co_await stream->events.recv();
+      REQUIRE(first);
+      REQUIRE(second);
+      REQUIRE(first->subject == "work.q");
+      REQUIRE(std::stoi(first->payload.substr(5)) + 2 == std::stoi(second->payload.substr(5)));
+    }
+
+    // A dropped member is skipped; the remaining one gets everything.
+    b.events.close();
+    co_await disco->queue_dispatch("work.q", "item-4");
+    co_await disco->queue_dispatch("work.q", "item-5");
+    auto e4 = co_await a.events.recv();
+    auto e5 = co_await a.events.recv();
+    REQUIRE(e4);
+    REQUIRE(e5);
+    REQUIRE(e4->payload == "item-4");
+    REQUIRE(e5->payload == "item-5");
+  }());
+
+  rt.shutdown();
+  REQUIRE(rt.join_tasks(2000ms));
+}
+
+TEST_CASE("queue dispatch over discoveryd: round-robin and no-responders",
+          "[discovery][queue][tcp]") {
+  auto server = discovery::DiscoveryServer::start();
+  auto rt_client = Runtime::create(test_config());
+  auto rt_worker = Runtime::create(test_config());
+  {
+    auto dispatcher = discovery::TcpDiscovery::connect(rt_client, server->address());
+    auto worker_a = discovery::TcpDiscovery::connect(rt_worker, server->address());
+    auto worker_b = discovery::TcpDiscovery::connect(rt_worker, server->address());
+
+    coro::sync_wait([&]() -> coro::Task<void> {
+      REQUIRE_THROWS_WITH(co_await dispatcher->queue_dispatch("work.q", "lost"),
+                          Catch::Matchers::ContainsSubstring("no responders"));
+
+      auto a = co_await worker_a->subscribe("work.q");
+      auto b = co_await worker_b->subscribe("work.q");
+
+      for (int i = 0; i < 4; ++i) {
+        co_await dispatcher->queue_dispatch("work.q", "item-" + std::to_string(i));
+      }
+      for (auto* stream : {&a, &b}) {
+        auto first = co_await stream->events.recv();
+        auto second = co_await stream->events.recv();
+        REQUIRE(first);
+        REQUIRE(second);
+        REQUIRE(std::stoi(first->payload.substr(5)) + 2 ==
+                std::stoi(second->payload.substr(5)));
+      }
+    }());
+
+    rt_client.shutdown();
+    rt_worker.shutdown();
+    REQUIRE(rt_client.join_tasks(3000ms));
+    REQUIRE(rt_worker.join_tasks(3000ms));
+  }
+  server->stop();
 }
 
 TEST_CASE("events: publish crosses processes via discoveryd", "[discovery][events][tcp]") {

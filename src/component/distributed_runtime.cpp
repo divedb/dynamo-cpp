@@ -398,4 +398,9 @@ std::string Endpoint::subject_for(int64_t instance_id) const {
          hex_id(instance_id);
 }
 
+std::string Endpoint::queue_subject() const {
+  // ":queue" cannot collide with instance subjects (those end in a hex id).
+  return component_.ns().name() + "/" + component_.name() + "/" + name_ + ":queue";
+}
+
 }  // namespace dynamo::component

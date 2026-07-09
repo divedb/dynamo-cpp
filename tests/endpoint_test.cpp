@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <set>
 #include <thread>
 
@@ -741,6 +742,65 @@ TEST_CASE("stats query reports request counts", "[endpoint][stats]") {
       auto stats = co_await client.scrape_stats(lease.id);
       REQUIRE(stats.at("requests").get<int>() == 1);
       REQUIRE(stats.at("errors").get<int>() == 0);
+    }());
+
+    rt.shutdown();
+    REQUIRE(rt.join_tasks(5000ms));
+  }
+}
+
+TEST_CASE("queue group balances requests across instances", "[endpoint][queue]") {
+  auto rt = Runtime::create(test_config());
+  {
+    auto drt = component::DistributedRuntime::create(rt, {});
+    auto endpoint = drt.ns(unique_ns()).component("backend").endpoint("generate");
+
+    coro::sync_wait([&]() -> coro::Task<void> {
+      co_await rt.primary().schedule();
+      auto client = co_await endpoint.client<std::string, int64_t>();
+
+      // Nobody in the group yet: fail fast, NATS-style.
+      REQUIRE_THROWS_WITH(co_await client.queue(pipeline::SingleIn<std::string>("x")),
+                          Catch::Matchers::ContainsSubstring("no responders"));
+
+      auto lease_a = co_await drt.discovery()->create_lease(10s);
+      auto lease_b = co_await drt.discovery()->create_lease(10s);
+      rt.spawn(endpoint.serve<std::string, int64_t>(
+          std::make_shared<LabelEngine>(1), {.lease = lease_a, .queue_group = true}));
+      rt.spawn(endpoint.serve<std::string, int64_t>(
+          std::make_shared<LabelEngine>(2), {.lease = lease_b, .queue_group = true}));
+
+      // An instance's queue subscription is registered before its discovery
+      // record, so two visible instances means two group members.
+      auto source = co_await drt.instance_source(endpoint);
+      while (source->snapshot().size() < 2) co_await source->wait_changed();
+
+      auto queue_one = [&]() -> coro::Task<int64_t> {
+        auto stream = co_await client.queue(pipeline::SingleIn<std::string>("req"));
+        auto label = co_await stream.next();
+        REQUIRE(label);
+        while (co_await stream.next()) {
+        }
+        co_return *label;
+      };
+
+      // Broker round-robin: an even split, not a random one.
+      std::map<int64_t, int> counts;
+      for (int i = 0; i < 8; ++i) counts[co_await queue_one()]++;
+      REQUIRE(counts[1] == 4);
+      REQUIRE(counts[2] == 4);
+
+      // A revoked instance leaves the group; the survivor gets everything.
+      lease_a.revoke();
+      for (int i = 0; i < 3; ++i) REQUIRE(co_await queue_one() == 2);
+
+      // Instance-addressed dispatch still works alongside the queue.
+      auto direct = co_await client.direct(pipeline::SingleIn<std::string>("req"), lease_b.id);
+      auto label = co_await direct.next();
+      REQUIRE(label);
+      REQUIRE(*label == 2);
+      while (co_await direct.next()) {
+      }
     }());
 
     rt.shutdown();

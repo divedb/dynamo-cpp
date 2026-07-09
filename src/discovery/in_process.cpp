@@ -47,6 +47,9 @@ struct InProcessDiscovery::Store {
   };
   std::list<Subscriber> subscribers;
 
+  /// Per-subject round-robin cursor for queue_dispatch.
+  std::unordered_map<std::string, size_t> queue_cursor;
+
   void notify_locked(const WatchEvent& event) {
     spdlog::debug("store notify: {} {} (watchers={})",
                   event.kind == WatchEvent::Kind::Put ? "put" : "delete", event.kv.key,
@@ -231,6 +234,22 @@ coro::Task<EventStream> InProcessDiscovery::subscribe(std::string subject) {
   std::lock_guard lock(store_->mutex);
   store_->subscribers.push_back({std::move(subject), std::move(tx)});
   co_return EventStream{std::move(rx)};
+}
+
+coro::Task<void> InProcessDiscovery::queue_dispatch(std::string subject, std::string payload) {
+  std::lock_guard lock(store_->mutex);
+  std::vector<decltype(store_->subscribers.begin())> matching;
+  for (auto it = store_->subscribers.begin(); it != store_->subscribers.end(); ++it) {
+    if (it->subject == subject) matching.push_back(it);
+  }
+  size_t& cursor = store_->queue_cursor[subject];
+  // Start at the cursor; a dead sink is dropped and the next member tried.
+  for (size_t attempt = 0; attempt < matching.size(); ++attempt) {
+    auto it = matching[cursor++ % matching.size()];
+    if (it->sink.send(Event{subject, payload})) co_return;
+    store_->subscribers.erase(it);
+  }
+  throw std::runtime_error("no responders for queue subject " + subject);
 }
 
 void InProcessDiscovery::shutdown() {}

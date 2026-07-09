@@ -498,6 +498,14 @@ coro::Task<void> TcpDiscovery::publish(std::string subject, std::string payload)
   }
 }
 
+coro::Task<void> TcpDiscovery::queue_dispatch(std::string subject, std::string payload) {
+  auto reply = co_await state_->request({{"op", "queue_dispatch"}, {"subject", subject}},
+                                        std::move(payload));
+  if (!reply.header.value("ok", false)) {
+    throw std::runtime_error("queue_dispatch failed: " + reply.header.value("error", ""));
+  }
+}
+
 coro::Task<EventStream> TcpDiscovery::subscribe(std::string subject) {
   auto s = state_;
   auto [tx, rx] = coro::make_channel<Event>(256, resume_on(s->runtime.secondary()));

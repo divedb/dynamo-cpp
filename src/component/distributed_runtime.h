@@ -43,6 +43,11 @@ struct ServeOptions {
   /// Advertised in the instance's discovery record.
   std::string description;
   std::string version = "0.1.0";
+  /// Also joins the endpoint's shared work queue: requests sent with
+  /// Client::queue() are broker-balanced across all instances serving with
+  /// this flag (NATS queue-group semantics). Instance-addressed dispatch
+  /// keeps working alongside.
+  bool queue_group = false;
 };
 
 /// Per-client knobs for the request path (Dynamo's StreamOptions role).
@@ -161,6 +166,8 @@ class Endpoint {
   std::string instance_key(int64_t instance_id) const;
   /// Instance-addressed subject.
   std::string subject_for(int64_t instance_id) const;
+  /// Instance-agnostic shared work-queue subject (queue groups).
+  std::string queue_subject() const;
 
   /// Serves `engine` on this endpoint until the lease (default: primary) or
   /// runtime is cancelled. Registers the instance in discovery; on

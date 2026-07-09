@@ -119,6 +119,39 @@ class EngineIngress final : public transports::PushHandler {
 
 namespace detail {
 
+/// Runs one queued work item; owns the ingress for the handler's lifetime
+/// (same pattern as the control plane's run_handler).
+template <typename Req, typename Resp>
+coro::Task<void> run_queued_item(std::shared_ptr<EngineIngress<Req, Resp>> ingress,
+                                 transports::RequestControlMessage control,
+                                 std::string payload) {
+  co_await ingress->handle(std::move(control), std::move(payload));
+}
+
+/// Queue-group pump: receives broker-balanced work items from the endpoint's
+/// queue subject and feeds them to the same ingress that serves
+/// instance-addressed dispatches. Ends when the subscription channel closes
+/// (lease death via the caller's registration, or discovery shutdown).
+template <typename Req, typename Resp>
+coro::Task<void> queue_pump(coro::Receiver<discovery::Event> events,
+                            std::shared_ptr<EngineIngress<Req, Resp>> ingress,
+                            Runtime runtime) {
+  while (auto event = co_await events.recv()) {
+    transports::RequestControlMessage control;
+    std::string payload;
+    try {
+      auto envelope = nlohmann::json::parse(event->payload);
+      control = envelope.at("control").template get<transports::RequestControlMessage>();
+      payload = envelope.at("payload").template get<std::string>();
+    } catch (const std::exception& e) {
+      spdlog::warn("queue pump: dropping malformed work item: {}", e.what());
+      continue;
+    }
+    // Concurrent like control-plane dispatches; each item runs detached.
+    runtime.spawn(run_queued_item(ingress, std::move(control), std::move(payload)));
+  }
+}
+
 /// Free coroutine taking the endpoint BY VALUE: member coroutines on value
 /// handles capture `this`, which dangles when called on a temporary
 /// (endpoint("x").serve(...) is legal and must stay safe).
@@ -150,6 +183,20 @@ coro::Task<void> serve_impl(Endpoint endpoint, pipeline::EnginePtr<Req, Resp> en
         return stats.dump();
       });
 
+  // Queue-group membership: subscribe to the endpoint's shared queue subject
+  // and pump broker-balanced items into the same ingress. The lease token
+  // closes the subscription channel, ending the pump with the instance.
+  std::optional<CancellationRegistration> queue_close;
+  coro::Receiver<discovery::Event> queue_events;
+  if (options.queue_group) {
+    auto stream = co_await drt.discovery()->subscribe(endpoint.queue_subject());
+    queue_events = stream.events;  // kept for teardown on registration failure
+    queue_close.emplace(lease.token.register_callback(
+        [events = stream.events]() mutable { events.close(); }));
+    drt.runtime().spawn_background(
+        detail::queue_pump<Req, Resp>(std::move(stream.events), ingress, drt.runtime()));
+  }
+
   EndpointInfo info;
   info.namespace_name = endpoint.component().ns().name();
   info.component = endpoint.component().name();
@@ -170,6 +217,7 @@ coro::Task<void> serve_impl(Endpoint endpoint, pipeline::EnginePtr<Req, Resp> en
   } catch (...) {
     control_plane->unregister_handler(subject);
     control_plane->unregister_query(stats_subject);
+    queue_events.close();  // ends the pump; no-op when not in a queue group
     throw;
   }
 

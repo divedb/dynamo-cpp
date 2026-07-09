@@ -37,6 +37,7 @@ class TcpDiscovery final : public Discovery,
   coro::Task<WatchStream> kv_get_and_watch_prefix(std::string prefix) override;
   coro::Task<void> publish(std::string subject, std::string payload) override;
   coro::Task<EventStream> subscribe(std::string subject) override;
+  coro::Task<void> queue_dispatch(std::string subject, std::string payload) override;
   void shutdown() override;
 
   /// Test hook: drops the current connection without shutting down, forcing

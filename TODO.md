@@ -88,11 +88,27 @@ source trees; test suite green at 122/122 (Debug).
   surface (serve/client/publish/subscribe/scrape/list/instance_source/
   primary_lease) now copies handles into free-coroutine frames eagerly.
 
-- [ ] **P3 — Shared work-queue dispatch (queue groups).**
-  Documented assumption: NATS queue-group load balancing is not reproduced
-  (client-side routing covers Dynamo's actual usage). Rust has a placeholder
-  (`egress/queue.rs`, 14 lines). If ever needed: a broker-side queue in
-  discoveryd or a worker-pull mode on the control plane.
+- [x] **P3 — Shared work-queue dispatch (queue groups).** *(done)*
+  NATS-faithful queue-group semantics as a broker-side op (note: this
+  exceeds Rust parity — `egress/queue.rs` is a 14-line placeholder there):
+  `Discovery::queue_dispatch(subject, payload)` delivers to exactly ONE
+  current subscriber of the subject, round-robin, dropping dead members and
+  trying the next; an empty group fails fast with a NATS-style
+  "no responders" error (nothing is buffered — at-most-once, like NATS).
+  Both backends implement it (in-process store + discoveryd
+  `queue_dispatch` op); workers reuse the existing event-subscription
+  machinery, so reconnect re-registration comes for free. Component layer:
+  `ServeOptions::queue_group` subscribes the instance to
+  `Endpoint::queue_subject()` ("{ns}/{comp}/{endpoint}:queue") and pumps
+  broker-balanced envelopes into the same `EngineIngress` as
+  instance-addressed dispatches; `Client::queue()` ships the
+  {control, payload} envelope through the broker and then follows the
+  normal call-home/arrival path (a worker that dies after pickup surfaces
+  as the arrival timeout). Tests: `[discovery][queue]` ×2 (both backends:
+  round-robin, dead-member skip, no-responders) and `[endpoint][queue]`
+  e2e (even 4/4 split across two instances, survivor takes over after a
+  lease revoke, direct dispatch still works alongside). 131/131 in
+  Debug/ASan/Release.
 
 ## 3. Local runtime & worker (`src/runtime/`)
 

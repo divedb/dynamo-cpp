@@ -96,6 +96,13 @@ class Discovery {
   /// Subscribes to events on `subject` (exact match).
   virtual coro::Task<EventStream> subscribe(std::string subject) = 0;
 
+  /// Queue-group dispatch (NATS queue-group semantics): delivers `payload` to
+  /// exactly ONE current subscriber of `subject`, round-robin. At-most-once:
+  /// delivery means the broker wrote the frame, not that the subscriber
+  /// processed it. Throws std::runtime_error("no responders ...") when the
+  /// subject has no subscribers — nothing is buffered.
+  virtual coro::Task<void> queue_dispatch(std::string subject, std::string payload) = 0;
+
   virtual void shutdown() = 0;
 };
 

@@ -100,6 +100,36 @@ class Client {
     co_return co_await random(std::move(request));
   }
 
+  /// Dispatches through the endpoint's shared work queue: the broker delivers
+  /// to exactly one instance serving with ServeOptions::queue_group
+  /// (round-robin). Delivery is at-most-once (NATS queue-group semantics):
+  /// throws immediately when no instance is subscribed ("no responders"),
+  /// and a worker that dies after pickup surfaces as an arrival timeout.
+  coro::Task<pipeline::ManyOut<Resp>> queue(pipeline::SingleIn<Req> request) {
+    auto [payload, controller] = std::move(request).into_parts();
+    pipeline::ContextPtr ctx = controller;
+
+    auto data_plane = endpoint_.drt().data_plane();
+    auto registered = data_plane->register_response_stream(ctx, options_.recv_buffer_count);
+    std::string subject = registered.info.subject;
+
+    transports::RequestControlMessage control;
+    control.id = ctx->id();
+    control.connection_info = registered.info;
+    nlohmann::json envelope{{"control", control},
+                            {"payload", nlohmann::json(payload).dump()}};
+
+    try {
+      co_await endpoint_.drt().discovery()->queue_dispatch(endpoint_.queue_subject(),
+                                                           envelope.dump());
+    } catch (...) {
+      data_plane->deregister(subject);
+      throw;
+    }
+
+    co_return co_await await_arrival(std::move(registered), std::move(subject), std::move(ctx));
+  }
+
   /// Unary call (SingleIn → SingleOut): dispatches with
   /// response_type=single_out to a random live instance and resolves to the
   /// single response value. Throws if the worker streams nothing back.
@@ -172,8 +202,15 @@ class Client {
     transports::dispatch_request(target.address, header, nlohmann::json(payload).dump(),
                                  options_.dispatch_timeout);
 
-    // Bound the wait for the worker's call-home: a worker that acked but died
-    // before connecting must not park us forever.
+    co_return co_await await_arrival(std::move(registered), std::move(subject), std::move(ctx));
+  }
+
+  /// Shared post-dispatch tail: bound the wait for the worker's call-home
+  /// (a worker that acked but died before connecting must not park us
+  /// forever), then resolve on the prologue.
+  coro::Task<pipeline::ManyOut<Resp>> await_arrival(transports::RegisteredStream registered,
+                                                    std::string subject,
+                                                    pipeline::ContextPtr ctx) {
     uint64_t timer_id = TimerQueue::instance().schedule_at(
         TimerQueue::Clock::now() + options_.arrival_timeout,
         [tx = registered.arrival_tx]() mutable {
@@ -186,7 +223,8 @@ class Client {
     TimerQueue::instance().cancel(timer_id);
     if (!arrival) throw std::runtime_error("data plane shut down while awaiting response stream");
     if (arrival->error) {
-      data_plane->deregister(subject);  // no-op if the worker already connected
+      // No-op if the worker already connected.
+      endpoint_.drt().data_plane()->deregister(subject);
       throw std::runtime_error("remote generate failed: " + *arrival->error);
     }
 

@@ -113,6 +113,9 @@ struct DiscoveryServer::State {
   };
   std::list<Subscriber> subscribers;
 
+  /// Per-subject round-robin cursor for queue_dispatch.
+  std::unordered_map<std::string, uint64_t> queue_cursor;
+
   size_t active_conns = 0;
   std::unordered_map<uint64_t, std::shared_ptr<Conn>> conns;
   uint64_t next_conn_id = 0;
@@ -313,6 +316,30 @@ void handle_request(DiscoveryServer::State& s, Conn& conn, uint64_t conn_id, con
         }
       }
       ++it;
+    }
+  } else if (op == "queue_dispatch") {
+    // Queue-group delivery: exactly one subscriber of `subject` gets the
+    // frame (round-robin); a dead connection is dropped and the next member
+    // tried. No members ⇒ NATS-style no-responders error, nothing buffered.
+    std::string subject = req.at("subject").get<std::string>();
+    std::vector<std::list<DiscoveryServer::State::Subscriber>::iterator> matching;
+    for (auto it = s.subscribers.begin(); it != s.subscribers.end(); ++it) {
+      if (it->subject == subject) matching.push_back(it);
+    }
+    uint64_t& cursor = s.queue_cursor[subject];
+    bool delivered = false;
+    for (size_t attempt = 0; attempt < matching.size(); ++attempt) {
+      auto it = matching[cursor++ % matching.size()];
+      json header{{"event", it->id}, {"subject", subject}};
+      if (it->conn->write(header, data)) {
+        delivered = true;
+        break;
+      }
+      s.subscribers.erase(it);
+    }
+    if (!delivered) {
+      reply["ok"] = false;
+      reply["error"] = "no responders for queue subject " + subject;
     }
   } else {
     reply["ok"] = false;
