@@ -82,7 +82,23 @@ DYN_DISCOVERY=127.0.0.1:7787 ./build/src/examples/hello_world_client
 # prints "hello world", streamed back one character at a time
 ```
 
-Environment: `DYN_DISCOVERY` (discoveryd address; empty = in-process),
+Multi process against a real etcd cluster (optional backend; built when CMake
+finds the system [etcd-cpp-apiv3](https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3)
+package, e.g. `brew install etcd-cpp-apiv3` — see `DYNAMO_WITH_ETCD`):
+
+```sh
+etcd &  # or any reachable etcd v3 cluster
+DYN_DISCOVERY=etcd://127.0.0.1:2379 ./build/src/examples/hello_world_server &
+DYN_DISCOVERY=etcd://127.0.0.1:2379 ./build/src/examples/hello_world_client
+```
+
+The etcd backend covers leases, kv, and prefix watches. It does NOT carry
+transient events or queue groups (etcd has no pub/sub; Dynamo pairs etcd with
+NATS for those) — `publish`/`subscribe`/`queue_dispatch` throw, so use
+discoveryd when those are needed.
+
+Environment: `DYN_DISCOVERY` (discoveryd address; `etcd://host:port` selects
+the etcd backend; empty = in-process),
 `DYN_HOST` (bind host for the control/data planes), `DYN_LOG`
 (trace|debug|info|warn|error), `DYN_LOGGING_JSONL` / `DYN_LOGGING_DISABLE_ANSI`,
 `DYN_RUNTIME_NUM_WORKER_THREADS`, `DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT`

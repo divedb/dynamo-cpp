@@ -8,6 +8,9 @@
 
 #include "discovery/in_process.h"
 #include "discovery/tcp.h"
+#ifdef DYNAMO_HAVE_ETCD
+#include "discovery/etcd.h"
+#endif
 #include "runtime/config.h"
 
 namespace dynamo::component {
@@ -158,6 +161,17 @@ DistributedRuntime DistributedRuntime::create(Runtime runtime, Options options) 
   if (options.discovery_address.empty()) {
     state->discovery = std::make_shared<discovery::InProcessDiscovery>(runtime);
     spdlog::debug("distributed runtime {} using in-process discovery", runtime.id());
+  } else if (options.discovery_address.rfind("etcd://", 0) == 0) {
+#ifdef DYNAMO_HAVE_ETCD
+    state->discovery =
+        discovery::EtcdDiscovery::connect(runtime, options.discovery_address.substr(7));
+    spdlog::debug("distributed runtime {} using etcd at {}", runtime.id(),
+                  options.discovery_address);
+#else
+    throw std::runtime_error("discovery address '" + options.discovery_address +
+                             "' needs a build with the etcd backend (DYNAMO_WITH_ETCD; "
+                             "install etcd-cpp-apiv3 and reconfigure)");
+#endif
   } else {
     state->discovery = discovery::TcpDiscovery::connect(runtime, options.discovery_address);
     spdlog::debug("distributed runtime {} using discoveryd at {}", runtime.id(),

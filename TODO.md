@@ -199,11 +199,31 @@ source trees; test suite green at 122/122 (Debug).
   deletes the key); create_or_validate succeeds iff absent or identical.
   Tests: `[discovery][kv]` ×2 (both backends).
 
-- [ ] **P3 — Real etcd/NATS backends.**
-  `Discovery` is an interface precisely so an `EtcdDiscovery` (grpc + protobuf
-  submodules are already declared in `.gitmodules`) can slot in later; same
-  for a NATS-based control plane. Large dependency cost; only if deployment
-  requires interop with an existing etcd/NATS cluster.
+- [x] **P3 — Real etcd backend.** *(done; NATS still out)*
+  `src/discovery/etcd.{h,cpp}`: `EtcdDiscovery` over the system
+  etcd-cpp-apiv3 package (optional — `DYNAMO_WITH_ETCD` auto-disables when
+  CMake can't find it, so plain checkouts/CI build unchanged). Selected via
+  `DYN_DISCOVERY=etcd://host:port`. Mapping: leases = leasegrant + a
+  KeepAlive per lease (failure cancels the token; token cancellation
+  leaserevokes; primary lease on the runtime root token); kv_create = etcd
+  `add` (native create-if-absent); kv_create_or_validate = one atomic txn
+  (compare create_revision==0 ? put : range + client-side compare — the
+  library reports a failed compare as ERROR_COMPARE_FAILED with the failure
+  branch attached); watches = `ls` snapshot at revision R + native watch
+  from R+1 (no gaps, no dupes). Blocking SyncClient calls run on pool
+  threads (pplx never enters our code). NOT supported (throws, documented):
+  publish/subscribe/queue_dispatch — etcd has no pub/sub; Dynamo pairs etcd
+  with NATS for events. Hard-won lifecycle rule (comment in etcd.cpp):
+  KeepAlive/Watcher callbacks must capture no State (State→Runtime→
+  ~ThreadPool self-join — the recorded teardown hazard hit again, found via
+  `thread::join: Resource deadlock avoided`); dead objects park in State
+  until shutdown(). Tests: `[discovery][etcd]` ×4 (kv semantics, watch
+  snapshot/live/lease-death, keep-alive outliving the TTL, component-layer
+  e2e over `etcd://`) — they SKIP without a reachable server
+  (`DYN_TEST_ETCD`, default :2379); 135/135 with etcd running in
+  Debug/ASan/Release, and the no-etcd configure path builds clean.
+  A NATS control plane remains out of scope (different transport role;
+  revisit only for interop with an existing NATS deployment).
 
 - [ ] **P3 — discoveryd HA/persistence.**
   Single-node, in-memory only. Snapshot/restore or raft is out of scope for

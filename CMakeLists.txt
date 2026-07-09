@@ -29,6 +29,23 @@ option(DYNAMO_BUILD_TESTS "Build dynamo-cpp tests" ${DYNAMO_IS_TOP_LEVEL})
 option(DYNAMO_BUILD_EXAMPLES "Build dynamo-cpp examples" ${DYNAMO_IS_TOP_LEVEL})
 option(DYNAMO_WERROR "Treat warnings as errors for dynamo-cpp targets" OFF)
 option(DYNAMO_SANITIZE "Enable ASan+UBSan for dynamo-cpp targets" OFF)
+option(DYNAMO_WITH_ETCD "Build the etcd discovery backend (needs etcd-cpp-apiv3)" ON)
+
+# The etcd backend is optional: it needs the system-installed etcd-cpp-apiv3
+# package (gRPC + protobuf + cpprestsdk). Auto-disabled when absent so plain
+# checkouts and CI keep building without it.
+if(DYNAMO_WITH_ETCD)
+  # Pre-load protobuf in CONFIG mode: etcd-cpp-api's config finds Protobuf via
+  # the legacy module, then gRPC's config loads the CONFIG package — the two
+  # define overlapping-but-different target sets and CMake errors out.
+  # Resolving Protobuf first (CONFIG) makes both find_dependency calls no-ops.
+  find_package(Protobuf CONFIG QUIET)
+  find_package(etcd-cpp-api CONFIG QUIET)
+  if(NOT etcd-cpp-api_FOUND)
+    set(DYNAMO_WITH_ETCD OFF)
+    message(STATUS "etcd-cpp-apiv3 not found; building without the etcd backend")
+  endif()
+endif()
 
 # Warning/sanitizer flags applied only to our own targets via this interface lib.
 add_library(dynamo_warnings INTERFACE)
@@ -60,4 +77,4 @@ if(DYNAMO_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-message(STATUS "dynamo-cpp configured: tests=${DYNAMO_BUILD_TESTS} examples=${DYNAMO_BUILD_EXAMPLES} werror=${DYNAMO_WERROR} sanitize=${DYNAMO_SANITIZE}")
+message(STATUS "dynamo-cpp configured: tests=${DYNAMO_BUILD_TESTS} examples=${DYNAMO_BUILD_EXAMPLES} werror=${DYNAMO_WERROR} sanitize=${DYNAMO_SANITIZE} etcd=${DYNAMO_WITH_ETCD}")

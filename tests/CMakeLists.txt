@@ -15,6 +15,12 @@ add_executable(dynamo_tests
   llm_http_test.cpp
   llm_kv_router_test.cpp
 )
+# etcd backend tests: compiled only with the backend; they SKIP themselves at
+# runtime when no etcd server is reachable (DYN_TEST_ETCD, default :2379).
+if(DYNAMO_WITH_ETCD)
+  target_sources(dynamo_tests PRIVATE discovery_etcd_test.cpp)
+endif()
+
 target_link_libraries(dynamo_tests PRIVATE dynamo dynamo_llm dynamo_warnings Catch2::Catch2WithMain)
 
 include(Catch)
