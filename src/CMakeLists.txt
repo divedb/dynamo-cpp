@@ -14,6 +14,7 @@ add_library(dynamo STATIC
   discovery/in_process.cpp
   discovery/server.cpp
   discovery/tcp.cpp
+  transports/auth.cpp
   transports/codec.cpp
   transports/control_plane.cpp
   transports/data_plane.cpp
@@ -28,6 +29,16 @@ target_compile_features(dynamo PUBLIC cxx_std_20)
 
 find_package(Threads REQUIRED)
 target_link_libraries(dynamo PUBLIC Threads::Threads)
+
+if(DYNAMO_WITH_TLS)
+  target_sources(dynamo PRIVATE transports/tls.cpp)
+  # PUBLIC define: tests compile TLS cases conditionally on it. OpenSSL stays
+  # private to tls.cpp (tls.h exposes no OpenSSL types).
+  target_compile_definitions(dynamo PUBLIC DYNAMO_HAVE_TLS)
+  target_link_libraries(dynamo PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+else()
+  target_sources(dynamo PRIVATE transports/tls_stub.cpp)
+endif()
 
 if(DYNAMO_WITH_ETCD)
   target_sources(dynamo PRIVATE discovery/etcd.cpp)
@@ -54,9 +65,24 @@ add_library(dynamo_llm STATIC
   llm/kv_router/scheduler.cpp
   llm/kv_router/publisher.cpp
   llm/kv_router/router.cpp
+  llm/kv/reuse.cpp
+  llm/kv/reserved.cpp
+  llm/kv/manager.cpp
+  llm/kv/storage.cpp
+  llm/kv/layer.cpp
   llm/tokenizers.cpp
   llm/tokens.cpp
 )
+
+# KV block-copy backend: one implementation of the ABI in kernels/block_copy.h
+# is linked per build (see the root CMakeLists for detection).
+if(DYNAMO_WITH_CUDA)
+  target_sources(dynamo_llm PRIVATE llm/kv/kernels/block_copy.cu)
+  target_compile_definitions(dynamo_llm PUBLIC DYNAMO_HAVE_CUDA)
+  target_link_libraries(dynamo_llm PRIVATE CUDA::cudart)
+else()
+  target_sources(dynamo_llm PRIVATE llm/kv/kernels/block_copy_cpu.cpp)
+endif()
 target_link_libraries(dynamo_llm
   PUBLIC dynamo
   PRIVATE dynamo_warnings xxHash::xxhash minja::minja)

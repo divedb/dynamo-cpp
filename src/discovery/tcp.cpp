@@ -9,7 +9,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "transports/auth.h"
 #include "transports/socket.h"
+#include "transports/tls.h"
 
 namespace dynamo::discovery {
 
@@ -111,7 +113,8 @@ struct TcpDiscovery::State {
       }
       if (!first) {
         auto [host, port] = transports::parse_address(address);
-        auto fresh = Socket::connect(host, port);
+        auto fresh = Socket::connect(host, port, transports::tls::enabled());
+        if (fresh && !transports::auth::send(*fresh)) fresh.reset();
         if (!fresh) {
           std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
           backoff_ms = std::min(backoff_ms * 2, 2000);
@@ -374,8 +377,11 @@ coro::Task<void> keep_alive_loop(std::shared_ptr<TcpDiscovery::State> s, int64_t
 
 std::shared_ptr<TcpDiscovery> TcpDiscovery::connect(Runtime runtime, const std::string& address) {
   auto [host, port] = transports::parse_address(address);
-  auto sock = Socket::connect(host, port);
+  auto sock = Socket::connect(host, port, transports::tls::enabled());
   if (!sock) throw std::runtime_error("failed to connect to discoveryd at " + address);
+  if (!transports::auth::send(*sock)) {
+    throw std::runtime_error("failed to authenticate to discoveryd at " + address);
+  }
 
   auto client = std::shared_ptr<TcpDiscovery>(new TcpDiscovery());
   client->state_ = std::make_shared<State>(std::move(runtime));

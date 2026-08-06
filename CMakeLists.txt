@@ -30,6 +30,42 @@ option(DYNAMO_BUILD_EXAMPLES "Build dynamo-cpp examples" ${DYNAMO_IS_TOP_LEVEL})
 option(DYNAMO_WERROR "Treat warnings as errors for dynamo-cpp targets" OFF)
 option(DYNAMO_SANITIZE "Enable ASan+UBSan for dynamo-cpp targets" OFF)
 option(DYNAMO_WITH_ETCD "Build the etcd discovery backend (needs etcd-cpp-apiv3)" ON)
+option(DYNAMO_WITH_TLS "Build the mTLS transport layer (needs OpenSSL)" ON)
+option(DYNAMO_WITH_CUDA "Build the CUDA KV block-copy kernels (needs a CUDA toolchain)" ON)
+
+# The KV block-copy backend: CUDA kernels when a CUDA compiler exists,
+# otherwise a host-memory implementation of the same ABI (System/Pinned
+# tiers work; Device allocation fails at runtime).
+if(DYNAMO_WITH_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    find_package(CUDAToolkit QUIET)
+  endif()
+  if(NOT CMAKE_CUDA_COMPILER OR NOT CUDAToolkit_FOUND)
+    set(DYNAMO_WITH_CUDA OFF)
+    message(STATUS "CUDA toolchain not found; building the CPU block-copy backend")
+  endif()
+endif()
+
+# TLS is optional: auto-disabled when OpenSSL is absent (a stub then fails
+# loudly if DYN_TLS_* is set at runtime). On macOS, hint at the Homebrew keg.
+if(DYNAMO_WITH_TLS)
+  if(APPLE AND NOT DEFINED OPENSSL_ROOT_DIR)
+    foreach(brew_prefix /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3)
+      if(EXISTS "${brew_prefix}/include/openssl/ssl.h")
+        set(OPENSSL_ROOT_DIR "${brew_prefix}")
+        break()
+      endif()
+    endforeach()
+  endif()
+  find_package(OpenSSL 3.0 QUIET)  # tests use OpenSSL 3 APIs (EVP_EC_gen)
+  if(NOT OpenSSL_FOUND)
+    set(DYNAMO_WITH_TLS OFF)
+    message(STATUS "OpenSSL not found; building without TLS support")
+  endif()
+endif()
 
 # The etcd backend is optional: it needs the system-installed etcd-cpp-apiv3
 # package (gRPC + protobuf + cpprestsdk). Auto-disabled when absent so plain
@@ -77,4 +113,4 @@ if(DYNAMO_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-message(STATUS "dynamo-cpp configured: tests=${DYNAMO_BUILD_TESTS} examples=${DYNAMO_BUILD_EXAMPLES} werror=${DYNAMO_WERROR} sanitize=${DYNAMO_SANITIZE} etcd=${DYNAMO_WITH_ETCD}")
+message(STATUS "dynamo-cpp configured: tests=${DYNAMO_BUILD_TESTS} examples=${DYNAMO_BUILD_EXAMPLES} werror=${DYNAMO_WERROR} sanitize=${DYNAMO_SANITIZE} etcd=${DYNAMO_WITH_ETCD} tls=${DYNAMO_WITH_TLS} cuda=${DYNAMO_WITH_CUDA}")

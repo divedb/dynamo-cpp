@@ -3,6 +3,10 @@
 // Minimal RAII TCP primitives with two-part-message framing. I/O is blocking;
 // higher layers run it on dedicated threads and bridge to coroutines with
 // channels. shutdown() may be called from any thread to unblock reads.
+//
+// Optional mTLS (see tls.h): pass with_tls to connect()/bind() — the internal
+// planes pass tls::enabled(). TLS sockets keep the same blocking read/write
+// semantics, including full-duplex use from two threads.
 
 #pragma once
 
@@ -15,15 +19,17 @@
 
 namespace dynamo::transports {
 
+class TlsSession;
+
 class Socket {
  public:
-  Socket() = default;
-  explicit Socket(int fd) : fd_(fd) {}
-  Socket(Socket&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+  Socket();
+  explicit Socket(int fd);
+  Socket(Socket&& other) noexcept;
   Socket& operator=(Socket&& other) noexcept;
   Socket(const Socket&) = delete;
   Socket& operator=(const Socket&) = delete;
-  ~Socket() { close(); }
+  ~Socket();
 
   bool valid() const { return fd_ >= 0; }
   int fd() const { return fd_; }
@@ -51,7 +57,11 @@ class Socket {
   std::optional<TwoPartMessage> read_frame();
   bool write_frame(const TwoPartMessage& msg);
 
-  static std::optional<Socket> connect(const std::string& host, uint16_t port);
+  /// with_tls wraps the connection in a client-side TLS session (lazy
+  /// handshake). Throws on TLS misconfiguration.
+  static std::optional<Socket> connect(const std::string& host, uint16_t port,
+                                       bool with_tls = false);
+  bool is_tls() const { return tls_ != nullptr; }
 
   /// Process-wide inbound frame-size cap (default 256 MiB, or
   /// DYN_MAX_FRAME_MB at startup). Oversized frames fail the connection.
@@ -59,13 +69,18 @@ class Socket {
   static void set_max_frame_bytes(size_t bytes);
 
  private:
+  friend class Listener;
   int fd_ = -1;
+  std::unique_ptr<TlsSession> tls_;
 };
 
 /// Listening socket bound to `host:port` (port 0 = ephemeral).
 class Listener {
  public:
-  static std::optional<Listener> bind(const std::string& host, uint16_t port);
+  /// with_tls wraps every accepted connection in a server-side TLS session
+  /// (lazy handshake, so a stalling peer never blocks the accept loop).
+  static std::optional<Listener> bind(const std::string& host, uint16_t port,
+                                      bool with_tls = false);
 
   uint16_t port() const { return port_; }
   const std::string& host() const { return host_; }
@@ -79,8 +94,11 @@ class Listener {
   void shutdown();
 
  private:
-  Listener(int fd, int wake_rd, int wake_wr, std::string host, uint16_t port)
-      : fd_(std::make_shared<Fd>(fd, wake_rd, wake_wr)), host_(std::move(host)), port_(port) {}
+  Listener(int fd, int wake_rd, int wake_wr, std::string host, uint16_t port, bool with_tls)
+      : fd_(std::make_shared<Fd>(fd, wake_rd, wake_wr)),
+        host_(std::move(host)),
+        port_(port),
+        with_tls_(with_tls) {}
 
   struct Fd {
     Fd(int fd, int wake_rd, int wake_wr) : fd(fd), wake_rd(wake_rd), wake_wr(wake_wr) {}
@@ -92,6 +110,7 @@ class Listener {
   std::shared_ptr<Fd> fd_;
   std::string host_;
   uint16_t port_ = 0;
+  bool with_tls_ = false;
 };
 
 /// Splits "host:port". Throws std::invalid_argument on malformed input.

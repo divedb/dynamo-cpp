@@ -225,9 +225,11 @@ source trees; test suite green at 122/122 (Debug).
   A NATS control plane remains out of scope (different transport role;
   revisit only for interop with an existing NATS deployment).
 
-- [ ] **P3 — discoveryd HA/persistence.**
-  Single-node, in-memory only. Snapshot/restore or raft is out of scope for
-  now; document it as a deliberate limitation in docs/architecture.md.
+- [x] **P3 — discoveryd HA/persistence.** *(resolved: documented as a
+  deliberate limitation)* Single-node, in-memory only; snapshot/restore and
+  raft stay out of scope. docs/architecture.md §4 records the posture:
+  clients re-register through reconnect/resync after a discoveryd restart,
+  and deployments needing an HA control plane should use the etcd backend.
 
 ## 5. Transports (`src/transports/`)
 
@@ -269,10 +271,30 @@ source trees; test suite green at 122/122 (Debug).
   endpoint test feeds raw garbage to a live control plane and verifies the
   server keeps serving.
 
-- [ ] **P3 — TLS/authentication.**
-  Nothing on any socket (Dynamo delegates this to etcd/NATS deployment
-  options). Would need a TLS wrapper around `Socket` and token auth on
-  discoveryd/control plane.
+- [x] **P3 — TLS/authentication.** *(done; exceeds Rust parity — Dynamo
+  delegates this to etcd/NATS deployment options)*
+  `transports/tls.{h,cpp}`: optional mTLS for the internal planes
+  (discoveryd, control plane, data plane) over OpenSSL 3
+  (`DYNAMO_WITH_TLS` auto-disables when absent; a stub then fails loudly if
+  `DYN_TLS_*` is set — never silent plaintext). Config: `DYN_TLS_CERT/KEY/CA`
+  (all three) or `tls::configure()`; both directions verify against the
+  pinned CA (every node is client + server), TLS 1.3 only, no hostname
+  checks (private-CA trust). Key design point: our sockets are used
+  full-duplex from two threads (data-plane reader + control writers), which
+  `SSL*` doesn't support — `TlsSession` runs the fd non-blocking and holds a
+  mutex only across each non-blocking `SSL_read`/`SSL_write`, polling outside
+  the lock; handshakes are lazy so accept loops never block.
+  `transports/auth.{h,cpp}`: `DYN_AUTH_TOKEN` shared-token preamble frame on
+  every internal-plane connection, verified constant-time server-side before
+  anything is served. Not covered (documented in docs/architecture.md §4):
+  the HTTP frontend (raw-fd I/O, external clients — use a TLS-terminating
+  proxy, as Rust does) and the etcd backend's own connection. Tests:
+  `[transports][tls]` ×3 (full-duplex echo incl. 1 MiB frames, wrong-CA
+  rejection proving verification is on, plaintext↔TLS mixes fail cleanly),
+  `[transports][auth]` ×2 (control-plane token paths incl. raw-socket
+  rejects; discoveryd e2e), plus a TLS+token endpoint round trip; the
+  multi-process integration test passes with `DYN_TLS_*`+`DYN_AUTH_TOKEN`
+  exported. 137/137 in Debug/ASan/Release; no-OpenSSL configure builds clean.
 
 - [ ] **P3 — ZMQ-style transport (`transports/zmq.rs`, 418 lines).**
   Alternative data-plane transport in Rust (used by some deployments). Our
@@ -493,11 +515,75 @@ model and are not drop-in.
   (5/5) and still schedules cold prompts; eviction clears affinity. Tests:
   `[llm][kv]` — all green in Debug, ASan, Release.
 
+### M7 — KV block manager + copy kernels (`src/llm/kv/`) — DONE
+
+Port of `lib/llm/src/kv/` (5.5k lines; self-contained at v0.1.0 — nothing
+else in the Rust workspace references it) + `kernels/block_copy.cu`. The two
+halves are loosely coupled upstream (KvBlock's storage field is commented out
+at this commit): the block manager tracks token-block state by sequence hash;
+the storage/layer half moves tensor slabs. Wiring them per-request is the
+future engine integration's job.
+
+- [x] **Block manager.** *(done)* `kv/reuse.{h,cpp}`: KvBlock +
+  AvailableBlocks (parked blocks keep their state; in-order sequence-hash
+  matching; eviction = uninitialized first, then priority-FIFO via a
+  (priority, return_tick) ordered map; insert/update_priority/reset/
+  reset_all; RAII UniqueBlock returns state to the pool on drop, `take()`
+  detaches). `kv/reserved.{h,cpp}`: ReservedBlocks (seq-hash → weak inflight
+  registry; register dedups concurrent same-hash builds, loser's block
+  returns to the pool; last holder's drop erases the entry and releases the
+  block). `kv/manager.{h,cpp}`: KvStorageManager two-phase prefill
+  (match inflight → match reusable+promote → take fresh blocks + tail).
+  Deviations (commented): mutex-guarded state instead of Rust's
+  actor-task + channels (same call as the kv_router indexer); synchronous
+  API, no fence() (returns are inline, nothing to await); ~Inner erases only
+  expired entries (Rust removes + conditionally re-inserts).
+- [x] **Storage + TensorView.** *(done)* `kv/storage.{h,cpp}`: StorageKind
+  {Device, Pinned, System}, DType sizes, Storage/OwnedStorage,
+  TensorView<D> (row-major strides, slice, byte_offset/address, get/set/
+  fill on host tiers, contiguity checks, blocking view copies). Extensions
+  over Rust v0.1.0: System storage is implemented (Rust raises "not yet
+  supported" — required for host-only builds); view data()/copies honor the
+  view offset (Rust's copy ignores offset — latent bug there, only ever
+  called on full views).
+- [x] **Copy-kernel ABI + backends.** *(done)* `kv/kernels/block_copy.h`
+  declares the exact C ABI Rust binds via FFI (+ cuda_malloc_device/
+  cuda_free_device — Rust gets device alloc from cudarc).
+  `block_copy.cu` = the reference kernel vendored verbatim (NVIDIA
+  copyright kept) + the device-alloc additions; compiled only under
+  `DYNAMO_WITH_CUDA` (auto-off without a CUDA toolchain — always off on
+  macOS; the CUDA path has NOT been compiled or run here, no GPU — expect
+  the first CUDA build to shake out nits). `block_copy_cpu.cpp` implements
+  the same ABI over host memory (synchronous memcpy loops, immediate
+  "streams", device alloc fails), with identical offset math so one test
+  suite validates either backend. Reference quirk preserved (commented):
+  copy_stream_scatter ignores the staged block ids (identity mapping over
+  the staged pair count).
+- [x] **Layers + copy streams.** *(done)* `kv/layer.{h,cpp}`: KvLayout
+  {KvFirst, BlockFirst}, KvModelDetails/KvBlockDetails (prefix/suffix/elem
+  geometry, tp validation), KvLayer (5D shape, TensorView, one-shot
+  copy_blocks_to), KvBlockStorage (allocate / from_layers BYO-memory),
+  CopyStreamBlockMap (precomputed geometry), CopyStream (staged map + block
+  ids with uniqueness check, per-layer doorbell triggers, sync,
+  scatter_copy_layer TP-rescatter, reset). Deviations (commented):
+  copy_stream_destroy is called on destruction (Rust leaks the handle);
+  host↔host copies allowed uniformly (Rust rejects Pinned↔Pinned/System —
+  it always has CUDA).
+- Tests: `tests/llm_kv_block_test.cpp` — ports of the Rust reuse/reserved
+  tests (FIFO within priority, priority eviction + updates, reset paths,
+  inflight sharing/return, register dedup), the commented-out Rust manager
+  test extended (reuse-after-prefill, inflight sharing, exhaustion),
+  TensorView geometry/slicing/copy, layer allocation for both layouts,
+  copy_blocks_to, CopyStream staging/doorbells/re-staging, and
+  scatter_copy_layer verified element-by-element against an independently
+  derived permutation formula. 155/155 in Debug/ASan/Release.
+
 ## 9. Out of scope (tracked, no milestone)
 
-- **KV block manager + CUDA kernels** (`lib/llm/src/kv/`, 5.5k lines +
-  `block_copy.cu`) — engine-side memory management; needs CUDA and a real
-  engine to matter. Revisit only alongside a native engine integration.
+- ~~KV block manager + CUDA kernels~~ — **done as M8's prerequisite: see
+  §8 M7.** What remains engine-side (block↔storage pairing per request,
+  actual GPU residency management under a real engine) moves with the
+  engine-adapters item below.
 - **Real engine adapters** (`engines/`: vllm, sglang, trtllm, llamacpp,
   mistralrs, python — 4.9k lines) — each drags in an SDK or Python interop;
   M3's engine interface is the seam they'd plug into.

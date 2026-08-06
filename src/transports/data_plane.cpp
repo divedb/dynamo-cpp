@@ -9,6 +9,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include "transports/auth.h"
+#include "transports/tls.h"
+
 namespace dynamo::transports {
 
 using nlohmann::json;
@@ -65,6 +68,11 @@ void serve_data_connection(std::shared_ptr<DataPlaneServer::State> s, uint64_t c
   } cleanup{s, conn_id};
 
   try {
+    if (!auth::expect(*sock)) {
+      spdlog::warn("data plane: rejecting unauthenticated connection");
+      sock->shutdown();
+      return;
+    }
     auto hs_frame = sock->read_frame();
     if (!hs_frame || !hs_frame->has_header()) return;
     CallHomeHandshake handshake = json::parse(hs_frame->header);
@@ -153,7 +161,7 @@ std::shared_ptr<DataPlaneServer> DataPlaneServer::start(Runtime runtime, const s
   auto s = server->state_;
   s->runtime = std::move(runtime);
 
-  s->listener = Listener::bind(host, port);
+  s->listener = Listener::bind(host, port, tls::enabled());
   if (!s->listener) throw std::runtime_error("data plane: failed to bind " + host);
   spdlog::debug("data plane listening on {}", s->listener->address());
 
@@ -262,10 +270,14 @@ std::optional<StreamSender> StreamSender::connect(pipeline::ContextPtr ctx,
   std::optional<Socket> sock;
   for (int attempt = 0; attempt < 3 && !sock; ++attempt) {
     if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    sock = Socket::connect(host, port);
+    sock = Socket::connect(host, port, tls::enabled());
   }
   if (!sock) {
     spdlog::warn("data plane: failed to call home to {}", info.address);
+    return std::nullopt;
+  }
+  if (!auth::send(*sock)) {
+    spdlog::warn("data plane: failed to authenticate to {}", info.address);
     return std::nullopt;
   }
 

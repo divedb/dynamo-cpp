@@ -23,7 +23,9 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "transports/auth.h"
 #include "transports/socket.h"
+#include "transports/tls.h"
 
 namespace dynamo::discovery {
 
@@ -352,11 +354,16 @@ void handle_request(DiscoveryServer::State& s, Conn& conn, uint64_t conn_id, con
 void serve_discovery_connection(std::shared_ptr<DiscoveryServer::State> s, uint64_t conn_id,
                                 std::shared_ptr<Conn> conn) {
   try {
-    for (;;) {
-      auto frame = conn->sock->read_frame();
-      if (!frame || !frame->has_header()) break;
-      json req = json::parse(frame->header);
-      handle_request(*s, *conn, conn_id, req, std::move(frame->data));
+    if (!transports::auth::expect(*conn->sock)) {
+      spdlog::warn("discoveryd: rejecting unauthenticated connection");
+      conn->sock->shutdown();
+    } else {
+      for (;;) {
+        auto frame = conn->sock->read_frame();
+        if (!frame || !frame->has_header()) break;
+        json req = json::parse(frame->header);
+        handle_request(*s, *conn, conn_id, req, std::move(frame->data));
+      }
     }
   } catch (const std::exception& e) {
     spdlog::debug("discoveryd connection ended: {}", e.what());
@@ -378,7 +385,7 @@ std::shared_ptr<DiscoveryServer> DiscoveryServer::start(const std::string& host,
   server->state_ = std::make_shared<State>();
   auto s = server->state_;
 
-  s->listener = Listener::bind(host, port);
+  s->listener = Listener::bind(host, port, transports::tls::enabled());
   if (!s->listener) throw std::runtime_error("discoveryd: failed to bind " + host);
   spdlog::info("discoveryd listening on {}", s->listener->address());
 

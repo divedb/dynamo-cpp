@@ -8,7 +8,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include "transports/auth.h"
 #include "transports/socket.h"
+#include "transports/tls.h"
 
 namespace dynamo::transports {
 
@@ -62,6 +64,11 @@ void serve_control_connection(std::shared_ptr<ControlPlaneServer::State> s, uint
   } cleanup{s, conn_id};
 
   try {
+    if (!auth::expect(*sock)) {
+      spdlog::warn("control plane: rejecting unauthenticated connection");
+      sock->shutdown();
+      return;
+    }
     // Persistent connection: serve requests until the client closes or errs.
     for (;;) {
       auto frame = sock->read_frame();
@@ -106,7 +113,7 @@ std::shared_ptr<ControlPlaneServer> ControlPlaneServer::start(Runtime runtime,
   server->state_ = std::make_shared<State>(std::move(runtime));
   auto s = server->state_;
 
-  s->listener = Listener::bind(host, port);
+  s->listener = Listener::bind(host, port, tls::enabled());
   if (!s->listener) throw std::runtime_error("control plane: failed to bind " + host);
   spdlog::debug("control plane listening on {}", s->listener->address());
 
@@ -219,8 +226,11 @@ std::pair<Socket, TwoPartMessage> roundtrip(const std::string& address,
     }
     if (!sock) {
       auto [host, port] = parse_address(address);
-      sock = Socket::connect(host, port);
+      sock = Socket::connect(host, port, tls::enabled());
       if (!sock) throw std::runtime_error("control plane: cannot reach instance at " + address);
+      if (!auth::send(*sock)) {
+        throw std::runtime_error("control plane: failed to authenticate to " + address);
+      }
     }
     if (recv_timeout.count() > 0) sock->set_recv_timeout(recv_timeout);
 

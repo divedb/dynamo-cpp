@@ -230,3 +230,55 @@ hierarchical `CancellationToken` tree.
 5. `PushEndpoint` acks before processing (fire-and-forget dispatch); we keep
    the early-ack: control-plane dispatch succeeds once the worker accepts the
    frame, and all subsequent errors travel via the data-plane prologue.
+
+---
+
+## 4. Deliberate limitations
+
+### discoveryd: single node, in-memory
+
+`dynamo-discoveryd` is a **single-node, in-memory** discovery server by
+design. There is no snapshot/restore, no write-ahead log, and no replication
+(raft). If the process dies, all leases, keys, watches, and subscriptions are
+gone; clients reconnect with backoff and re-register what they own (workers
+re-serve, watchers resync via the snapshot + sync-marker protocol), so a
+*restarted* discoveryd converges back to a correct view, but anything not
+re-asserted by a live client is lost.
+
+This mirrors the deployment posture of the Rust reference, which delegates
+durability/HA to etcd. Deployments that need a highly available control plane
+should use the etcd backend (`DYN_DISCOVERY=etcd://host:port`, built when
+etcd-cpp-apiv3 is available) and run a real etcd cluster; discoveryd is meant
+for development, tests, and single-node deployments where "restart it and let
+clients re-register" is acceptable.
+
+### Transport security (mTLS + shared-token auth)
+
+The internal planes — discoveryd, the control plane, and the data plane — can
+be secured with two independently togglable, cluster-wide settings
+(`src/transports/tls.h`, `src/transports/auth.h`):
+
+- **Mutual TLS** (`DYN_TLS_CERT` / `DYN_TLS_KEY` / `DYN_TLS_CA`, all three
+  required together; needs an OpenSSL 3 build, `DYNAMO_WITH_TLS`). Every node
+  presents the cert and verifies the peer against the pinned CA in *both*
+  directions (every node is both client and server — the data plane calls
+  home). TLS 1.3 only; hostname verification is deliberately skipped — trust
+  is anchored in the private CA, not in names. Implementation note: sockets
+  are used full-duplex from two threads (data-plane reader + control-frame
+  writers), which OpenSSL's `SSL` objects don't support natively; the session
+  therefore runs the fd non-blocking and serializes each `SSL_read`/`SSL_write`
+  under a mutex held only for the non-blocking call, waiting in `poll()`
+  outside the lock. Handshakes are lazy (driven by the first read/write), so
+  a stalling peer never blocks an accept loop.
+- **Shared-token auth** (`DYN_AUTH_TOKEN`). When set, every new connection on
+  the internal planes starts with one auth frame; servers verify the token
+  (constant-time) before serving anything. The token authenticates cluster
+  membership only — pair it with TLS on untrusted networks or it travels in
+  cleartext.
+
+Deliberately **not** covered: the **HTTP frontend** (standard HTTP to external
+OpenAI clients — terminate TLS and authenticate in a proxy, as the Rust
+reference does) and the **etcd backend's own connection** (etcd deployments
+bring their own TLS/auth story). Without OpenSSL, the build links a stub that
+fails loudly at startup if `DYN_TLS_*` is set — TLS never silently degrades
+to plaintext.

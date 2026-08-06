@@ -5,6 +5,7 @@ add_executable(dynamo_tests
   runtime_test.cpp
   pipeline_test.cpp
   codec_test.cpp
+  security_test.cpp
   discovery_test.cpp
   endpoint_test.cpp
   soak_test.cpp
@@ -14,6 +15,7 @@ add_executable(dynamo_tests
   llm_model_card_test.cpp
   llm_http_test.cpp
   llm_kv_router_test.cpp
+  llm_kv_block_test.cpp
 )
 # etcd backend tests: compiled only with the backend; they SKIP themselves at
 # runtime when no etcd server is reachable (DYN_TEST_ETCD, default :2379).
@@ -22,6 +24,10 @@ if(DYNAMO_WITH_ETCD)
 endif()
 
 target_link_libraries(dynamo_tests PRIVATE dynamo dynamo_llm dynamo_warnings Catch2::Catch2WithMain)
+# security_test.cpp generates throwaway certificates with the OpenSSL API.
+if(DYNAMO_WITH_TLS)
+  target_link_libraries(dynamo_tests PRIVATE OpenSSL::Crypto)
+endif()
 
 include(Catch)
 catch_discover_tests(dynamo_tests PROPERTIES TIMEOUT 120)

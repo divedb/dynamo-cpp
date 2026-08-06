@@ -1,7 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-//
-// Lazy coroutine task with symmetric-transfer continuations (cppcoro-style).
-
 #pragma once
 
 #include <coroutine>
@@ -23,6 +19,7 @@ class TaskPromiseBase {
 
   struct FinalAwaiter {
     bool await_ready() noexcept { return false; }
+
     template <typename P>
     std::coroutine_handle<> await_suspend(std::coroutine_handle<P> h) noexcept {
       auto cont = h.promise().continuation_;
@@ -33,7 +30,9 @@ class TaskPromiseBase {
 
   FinalAwaiter final_suspend() noexcept { return {}; }
 
-  void set_continuation(std::coroutine_handle<> c) noexcept { continuation_ = c; }
+  void set_continuation(std::coroutine_handle<> c) noexcept {
+    continuation_ = c;
+  }
 
  protected:
   std::coroutine_handle<> continuation_ = nullptr;
@@ -50,11 +49,14 @@ class TaskPromise final : public TaskPromiseBase {
     result_.template emplace<1>(std::forward<U>(value));
   }
 
-  void unhandled_exception() noexcept { result_.template emplace<2>(std::current_exception()); }
+  void unhandled_exception() noexcept {
+    result_.template emplace<2>(std::current_exception());
+  }
 
   T take_result() {
     if (result_.index() == 2) std::rethrow_exception(std::get<2>(result_));
-    if (result_.index() != 1) throw std::logic_error("task completed without a value");
+    if (result_.index() != 1)
+      throw std::logic_error("task completed without a value");
     return std::move(std::get<1>(result_));
   }
 
@@ -87,7 +89,8 @@ class [[nodiscard]] Task {
 
   Task() noexcept = default;
   explicit Task(std::coroutine_handle<promise_type> h) noexcept : handle_(h) {}
-  Task(Task&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+  Task(Task&& other) noexcept
+      : handle_(std::exchange(other.handle_, nullptr)) {}
   Task& operator=(Task&& other) noexcept {
     if (this != &other) {
       if (handle_) handle_.destroy();
@@ -107,7 +110,8 @@ class [[nodiscard]] Task {
     struct Awaiter {
       std::coroutine_handle<promise_type> handle;
       bool await_ready() const noexcept { return !handle || handle.done(); }
-      std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting) noexcept {
+      std::coroutine_handle<> await_suspend(
+          std::coroutine_handle<> awaiting) noexcept {
         handle.promise().set_continuation(awaiting);
         return handle;
       }
@@ -128,7 +132,8 @@ Task<T> TaskPromise<T>::get_return_object() noexcept {
 }
 
 inline Task<void> TaskPromise<void>::get_return_object() noexcept {
-  return Task<void>(std::coroutine_handle<TaskPromise<void>>::from_promise(*this));
+  return Task<void>(
+      std::coroutine_handle<TaskPromise<void>>::from_promise(*this));
 }
 
 }  // namespace detail

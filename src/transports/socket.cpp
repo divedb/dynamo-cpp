@@ -18,21 +18,32 @@
 
 #include <spdlog/spdlog.h>
 
+#include "transports/tls.h"
+
 namespace dynamo::transports {
+
+Socket::Socket() = default;
+Socket::Socket(int fd) : fd_(fd) {}
+Socket::Socket(Socket&& other) noexcept
+    : fd_(std::exchange(other.fd_, -1)), tls_(std::move(other.tls_)) {}
+Socket::~Socket() { close(); }
 
 Socket& Socket::operator=(Socket&& other) noexcept {
   if (this != &other) {
     close();
     fd_ = std::exchange(other.fd_, -1);
+    tls_ = std::move(other.tls_);
   }
   return *this;
 }
 
 void Socket::shutdown() {
+  // Works for TLS too: poll()-based session reads wake and fail.
   if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
 }
 
 void Socket::close() {
+  tls_.reset();  // frees the session (best-effort close_notify) before the fd
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
@@ -40,6 +51,7 @@ void Socket::close() {
 }
 
 bool Socket::write_all(std::string_view buf) {
+  if (tls_) return tls_->write_all(buf);
   size_t sent = 0;
   while (sent < buf.size()) {
     ssize_t n = ::send(fd_, buf.data() + sent, buf.size() - sent,
@@ -59,6 +71,7 @@ bool Socket::write_all(std::string_view buf) {
 }
 
 bool Socket::read_exact(char* out, size_t n) {
+  if (tls_) return tls_->read_exact(out, n);
   size_t got = 0;
   while (got < n) {
     ssize_t r = ::recv(fd_, out + got, n - got, 0);
@@ -73,6 +86,10 @@ bool Socket::read_exact(char* out, size_t n) {
 }
 
 void Socket::set_recv_timeout(std::chrono::milliseconds timeout) {
+  if (tls_) {
+    tls_->set_read_timeout(timeout);
+    return;
+  }
   struct timeval tv;
   tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
   tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
@@ -82,6 +99,11 @@ void Socket::set_recv_timeout(std::chrono::milliseconds timeout) {
 void Socket::drain(std::chrono::milliseconds timeout) {
   set_recv_timeout(timeout);
   char buf[1024];
+  if (tls_) {
+    while (tls_->read_some(buf, sizeof(buf)) > 0) {
+    }
+    return;
+  }
   for (;;) {
     ssize_t r = ::recv(fd_, buf, sizeof(buf), 0);
     if (r <= 0) return;  // EOF, error, or timeout
@@ -137,7 +159,7 @@ bool Socket::write_frame(const TwoPartMessage& msg) {
   return write_all(TwoPartCodec().encode(msg));
 }
 
-std::optional<Socket> Socket::connect(const std::string& host, uint16_t port) {
+std::optional<Socket> Socket::connect(const std::string& host, uint16_t port, bool with_tls) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return std::nullopt;
 
@@ -157,7 +179,9 @@ std::optional<Socket> Socket::connect(const std::string& host, uint16_t port) {
 #ifdef SO_NOSIGPIPE
   ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-  return Socket(fd);
+  Socket sock(fd);
+  if (with_tls) sock.tls_ = TlsSession::make_client(fd);  // misconfig throws (fd freed by sock)
+  return sock;
 }
 
 Listener::Fd::~Fd() {
@@ -166,7 +190,7 @@ Listener::Fd::~Fd() {
   if (wake_wr >= 0) ::close(wake_wr);
 }
 
-std::optional<Listener> Listener::bind(const std::string& host, uint16_t port) {
+std::optional<Listener> Listener::bind(const std::string& host, uint16_t port, bool with_tls) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return std::nullopt;
   int one = 1;
@@ -193,7 +217,7 @@ std::optional<Listener> Listener::bind(const std::string& host, uint16_t port) {
   sockaddr_in bound{};
   socklen_t len = sizeof(bound);
   ::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len);
-  return Listener(fd, wake[0], wake[1], host, ntohs(bound.sin_port));
+  return Listener(fd, wake[0], wake[1], host, ntohs(bound.sin_port), with_tls);
 }
 
 std::optional<Socket> Listener::accept() {
@@ -214,7 +238,19 @@ std::optional<Socket> Listener::accept() {
 #ifdef SO_NOSIGPIPE
       ::setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-      return Socket(conn);
+      Socket sock(conn);
+      if (with_tls_) {
+        // Lazy handshake: attaching the session never blocks this loop. A
+        // TLS misconfiguration must not kill the accept thread — drop the
+        // connection and keep serving.
+        try {
+          sock.tls_ = TlsSession::make_server(conn);
+        } catch (const std::exception& e) {
+          spdlog::error("listener: cannot start TLS on accepted connection: {}", e.what());
+          continue;
+        }
+      }
+      return sock;
     }
     if (errno == EINTR || errno == ECONNABORTED) continue;
     return std::nullopt;
